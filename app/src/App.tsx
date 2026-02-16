@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import './App.css';
 import { RpcProvider } from 'starknet';
 import { disconnect } from '@starknet-io/get-starknet';
@@ -7,12 +7,18 @@ import { TransactionFetcher, type SwapProtocolConfig, type SwapWithPrice } from 
 
 const STARKNET_SNAP_ID = 'npm:@consensys/starknet-snap';
 
+type AutoFetchConfig = {
+  rpcUrl: string;
+  pragmaBaseUrl: string;
+  pragmaPair?: string;
+  lookbackBlocks: number;
+  protocols: SwapProtocolConfig[];
+};
+
 function App() {
   const [connectedAddress, setConnectedAddress] = useState('');
-  const [manualAddress, setManualAddress] = useState('');
   const [walletLabel, setWalletLabel] = useState('');
   const [walletLoading, setWalletLoading] = useState(false);
-  const [snapEnabling, setSnapEnabling] = useState(false);
   const [walletError, setWalletError] = useState<string | null>(null);
 
   const [bridgeLoading, setBridgeLoading] = useState(false);
@@ -20,34 +26,14 @@ function App() {
   const [bridgeNotice, setBridgeNotice] = useState<string | null>(null);
   const [bridgeRows, setBridgeRows] = useState<SwapWithPrice[]>([]);
 
-  const [jediswapContract, setJediswapContract] = useState(import.meta.env.VITE_JEDISWAP_CONTRACT ?? '');
-  const [ekuboContract, setEkuboContract] = useState(import.meta.env.VITE_EKUBO_CONTRACT ?? '');
-  const [rpcUrl, setRpcUrl] = useState(import.meta.env.VITE_RPC_URL ?? 'https://starknet-mainnet.public.blastapi.io/rpc/v0_8');
-  const [pragmaBaseUrl, setPragmaBaseUrl] = useState(import.meta.env.VITE_PRAGMA_BASE_URL ?? '');
-  const [pragmaPair, setPragmaPair] = useState(import.meta.env.VITE_PRAGMA_PAIR ?? 'ETH/USD');
-  const [lookbackBlocks, setLookbackBlocks] = useState('1200');
-
-  const [walletDiagnostics, setWalletDiagnostics] = useState({
-    lastAttempt: 'idle',
-    hasEthereumProvider: false,
-    hasInjectedSnapProvider: false,
-    authorizedWalletIds: [] as string[],
-    availableWalletIds: [] as string[],
-    lastError: null as string | null,
-  });
+  const autoFetchConfig = useMemo(buildAutoFetchConfig, []);
+  const activeAddress = connectedAddress.trim();
 
   useEffect(() => {
-    void refreshWalletDiagnostics('startup');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    if (!connectedAddress) return;
+    if (!activeAddress) return;
     void fetchRecentTransactions('auto');
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connectedAddress]);
-
-  const activeAddress = connectedAddress.trim();
+  }, [activeAddress]);
 
   const shortHex = (value: string | null | undefined, start = 8, end = 6): string => {
     if (!value) return '-';
@@ -60,85 +46,13 @@ function App() {
     return `${value} (${new Date(value * 1000).toISOString()})`;
   };
 
-  const buildProtocolConfigs = (): SwapProtocolConfig[] => {
-    const configs: SwapProtocolConfig[] = [
-      ...(jediswapContract.trim()
-        ? [{ name: 'Jediswap', contractAddress: jediswapContract.trim(), eventNames: ['Swap'] }]
-        : []),
-      ...(ekuboContract.trim()
-        ? [{ name: 'Ekubo', contractAddress: ekuboContract.trim(), eventNames: ['Swap'] }]
-        : []),
-    ];
-
-    if (!configs.length) {
-      throw new Error('Set at least one protocol contract address (Jediswap or Ekubo).');
-    }
-    return configs;
-  };
-
-  const createFetcher = (protocolConfigs: SwapProtocolConfig[]) => {
-    const baseUrl = pragmaBaseUrl.trim();
-    if (!baseUrl) throw new Error('Pragma base URL is required.');
-    const nodeUrl = rpcUrl.trim();
-    if (!nodeUrl) throw new Error('RPC URL is required.');
-
-    const provider = new RpcProvider({
-      nodeUrl,
-    });
-
-    return new TransactionFetcher(provider, protocolConfigs, {
-      baseUrl,
-      queryParams: pragmaPair.trim() ? { pair: pragmaPair.trim() } : undefined,
+  const createFetcher = () => {
+    const provider = new RpcProvider({ nodeUrl: autoFetchConfig.rpcUrl });
+    return new TransactionFetcher(provider, autoFetchConfig.protocols, {
+      baseUrl: autoFetchConfig.pragmaBaseUrl,
+      queryParams: autoFetchConfig.pragmaPair ? { pair: autoFetchConfig.pragmaPair } : undefined,
       apiKey: import.meta.env.VITE_PRAGMA_API_KEY,
     });
-  };
-
-  const refreshWalletDiagnostics = async (lastAttempt: string, error?: unknown) => {
-    const ethereum = getEthereumProvider();
-    const injected = getInjectedMetaMaskSnap();
-    const starknet = getStarknet();
-
-    let authorizedWalletIds: string[] = [];
-    let availableWalletIds: string[] = [];
-    let lastError: string | null = error instanceof Error ? error.message : error ? String(error) : null;
-
-    try {
-      await starknet.discoverVirtualWallets();
-      const authorized = await starknet.getAuthorizedWallets({ sort: ['metamask', 'argentX', 'braavos'] });
-      const available = await starknet.getAvailableWallets({ sort: ['metamask', 'argentX', 'braavos'] });
-      authorizedWalletIds = authorized.map((wallet) => `${wallet.name} (${wallet.id})`);
-      availableWalletIds = available.map((wallet) => `${wallet.name} (${wallet.id})`);
-    } catch (diagError) {
-      if (!lastError) {
-        lastError = diagError instanceof Error ? diagError.message : String(diagError);
-      }
-    }
-
-    setWalletDiagnostics({
-      lastAttempt,
-      hasEthereumProvider: Boolean(ethereum?.request),
-      hasInjectedSnapProvider: Boolean(injected?.request),
-      authorizedWalletIds,
-      availableWalletIds,
-      lastError,
-    });
-  };
-
-  const enableMetaMaskSnap = async () => {
-    try {
-      setSnapEnabling(true);
-      setWalletError(null);
-      const enabled = await requestStarknetSnapFromMetaMask();
-      if (!enabled) {
-        setWalletError('Could not enable Starknet Snap via MetaMask. Check Snaps permission and install status.');
-      }
-      await refreshWalletDiagnostics('enable-snap');
-    } catch (error) {
-      setWalletError(error instanceof Error ? error.message : String(error));
-      await refreshWalletDiagnostics('enable-snap-error', error);
-    } finally {
-      setSnapEnabling(false);
-    }
   };
 
   const connectWallet = async () => {
@@ -147,31 +61,18 @@ function App() {
       setWalletError(null);
       setBridgeError(null);
       setBridgeNotice(null);
-      await refreshWalletDiagnostics('connect-start');
       await requestStarknetSnapFromMetaMask();
 
-      const attemptErrors: string[] = [];
       let wallet: StarknetWindowObject | null = null;
-
       try {
         wallet = await connectUsingInjectedMetaMaskSnap();
-      } catch (error) {
-        attemptErrors.push(`injected-snap: ${error instanceof Error ? error.message : String(error)}`);
+      } catch {
+        wallet = null;
       }
+      if (!wallet) wallet = await connectUsingCoreWalletFlow();
 
       if (!wallet) {
-        try {
-          wallet = await connectUsingCoreWalletFlow();
-        } catch (error) {
-          attemptErrors.push(`core-wallet-flow: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-
-      if (!wallet) {
-        throw new Error(
-          `Could not connect through Starknet Snap provider. ${attemptErrors.length ? `Details: ${attemptErrors.join(' | ')}` : 'No wallet provider returned an account.'
-          }`
-        );
+        throw new Error('Could not connect through Starknet Snap provider. Verify MetaMask Snap permissions and retry.');
       }
 
       const accounts = await requestAccountsWithFallbacks(wallet);
@@ -181,18 +82,11 @@ function App() {
 
       setConnectedAddress(accounts[0]);
       setWalletLabel(wallet.name);
-      await refreshWalletDiagnostics('connect-success');
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
-      if (isSnapChunkLoadError(raw)) {
-        setWalletError(
-          'MetaMask Starknet Snap is failing to load remote chunks from snaps.consensys.io. ' +
-          'Use the manual Starknet address fallback below to continue fetching transactions now.'
-        );
-      } else {
-        setWalletError(raw);
-      }
-      await refreshWalletDiagnostics('connect-error', error);
+      setWalletError(isSnapChunkLoadError(raw)
+        ? 'MetaMask Starknet Snap failed to load required remote assets. Please retry and verify snaps.consensys.io access.'
+        : raw);
     } finally {
       setWalletLoading(false);
     }
@@ -208,7 +102,6 @@ function App() {
       setWalletError(null);
       setBridgeError(null);
       setBridgeNotice(null);
-      await refreshWalletDiagnostics('disconnect');
     } catch (error) {
       setWalletError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -225,28 +118,24 @@ function App() {
         setBridgeRows([]);
       }
 
-      if (!activeAddress) throw new Error('Connect wallet first or set a manual Starknet address.');
-      const protocolConfigs = buildProtocolConfigs();
-      const fetcher = createFetcher(protocolConfigs);
-      const lookback = Number(lookbackBlocks.trim());
-      const lookbackSafe = Number.isFinite(lookback) && lookback > 0 ? Math.floor(lookback) : 1200;
+      if (!activeAddress) throw new Error('Connect wallet first.');
+      if (!autoFetchConfig.protocols.length) throw new Error('Backend config missing: no protocol contracts configured.');
+      if (!autoFetchConfig.rpcUrl) throw new Error('Backend config missing: RPC URL.');
 
+      const fetcher = createFetcher();
       const rows = await fetcher.fetchRecentSwapsWithPragma({
         userAddress: activeAddress,
-        lookbackBlocks: lookbackSafe,
+        lookbackBlocks: autoFetchConfig.lookbackBlocks,
       });
 
       setBridgeRows(rows);
-      setBridgeNotice(`Loaded ${rows.length} recent swaps.`);
+      setBridgeNotice(`Loaded ${rows.length} recent swaps automatically.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const hint = message.includes('Failed to fetch')
-        ? ' Check RPC URL/CORS/network access (for mainnet use a public Starknet RPC endpoint).'
-        : '';
       if (mode === 'auto') {
-        setBridgeNotice(`Wallet connected, but auto-fetch failed: ${message}.${hint}`);
+        setBridgeNotice(`Auto-fetch failed: ${message}`);
       } else {
-        setBridgeError(`${message}.${hint}`);
+        setBridgeError(message);
       }
     } finally {
       setBridgeLoading(false);
@@ -257,112 +146,40 @@ function App() {
     <div className="simple-shell">
       <header className="simple-header">
         <p className="eyebrow">Scaffold Garaga</p>
-        <h1>Starknet Wallet + Transaction Fetch</h1>
-        <p>Minimal flow: connect Starknet wallet via MetaMask Snap, then fetch recent swaps and Pragma signatures.</p>
+        <h1>Connect Wallet to Load Recent Transactions</h1>
+        <p>Transaction fetch configuration is managed on backend/env. Connect wallet to load recent swaps automatically.</p>
       </header>
 
       <section className="card">
         <div className="wallet-row">
           <div>
             {activeAddress
-              ? `Connected: ${walletLabel || 'Wallet'} (${shortHex(connectedAddress)})`
+              ? `Connected: ${walletLabel || 'Wallet'} (${shortHex(activeAddress)})`
               : 'No wallet connected.'}
           </div>
           {!activeAddress ? (
+            <button className="primary-button" onClick={connectWallet} disabled={walletLoading}>
+              {walletLoading ? 'Connecting…' : 'Connect Wallet'}
+            </button>
+          ) : (
             <div className="wallet-actions">
-              <button className="secondary-button" onClick={enableMetaMaskSnap} disabled={snapEnabling || walletLoading}>
-                {snapEnabling ? 'Enabling…' : 'Enable Starknet Snap'}
+              <button
+                className="secondary-button"
+                disabled={bridgeLoading}
+                onClick={() => {
+                  void fetchRecentTransactions('manual');
+                }}
+              >
+                {bridgeLoading ? 'Refreshing…' : 'Refresh'}
               </button>
-              <button className="primary-button" onClick={connectWallet} disabled={snapEnabling || walletLoading}>
-                {walletLoading ? 'Connecting…' : 'Connect Wallet'}
+              <button className="secondary-button" onClick={disconnectWallet} disabled={walletLoading}>
+                Disconnect
               </button>
             </div>
-          ) : (
-            <button className="secondary-button" onClick={disconnectWallet} disabled={walletLoading}>
-              Disconnect
-            </button>
           )}
         </div>
 
-        <div className="diagnostics">
-          <div><strong>Diagnostics:</strong> {walletDiagnostics.lastAttempt}</div>
-          <div>Ethereum provider: {walletDiagnostics.hasEthereumProvider ? 'yes' : 'no'}</div>
-          <div>Injected Starknet Snap: {walletDiagnostics.hasInjectedSnapProvider ? 'yes' : 'no'}</div>
-          <div>Authorized wallets: {walletDiagnostics.authorizedWalletIds.join(', ') || 'none'}</div>
-          <div>Available wallets: {walletDiagnostics.availableWalletIds.join(', ') || 'none'}</div>
-          {walletDiagnostics.lastError && <div>Last error: {walletDiagnostics.lastError}</div>}
-        </div>
-
         {walletError && <div className="error-message">{walletError}</div>}
-
-        {!activeAddress && (
-          <div className="manual-address-row">
-            <div className="field">
-              <label htmlFor="manual-address">Manual Starknet address fallback</label>
-              <input
-                id="manual-address"
-                value={manualAddress}
-                onChange={(e) => setManualAddress(e.target.value)}
-                placeholder="0x..."
-              />
-            </div>
-            <button
-              className="secondary-button"
-              onClick={() => {
-                const value = manualAddress.trim();
-                if (!isLikelyStarknetAddress(value)) {
-                  setWalletError('Enter a valid Starknet address (0x...) to use manual mode.');
-                  return;
-                }
-                setWalletError(null);
-                setConnectedAddress(value);
-                setWalletLabel('Manual Address');
-              }}
-            >
-              Use Address
-            </button>
-          </div>
-        )}
-      </section>
-
-      <section className="card">
-        <h2>Transaction Fetch Config</h2>
-        <div className="config-grid">
-          <div className="field">
-            <label htmlFor="jediswap-contract">Jediswap contract</label>
-            <input id="jediswap-contract" value={jediswapContract} onChange={(e) => setJediswapContract(e.target.value)} />
-          </div>
-          <div className="field">
-            <label htmlFor="ekubo-contract">Ekubo contract</label>
-            <input id="ekubo-contract" value={ekuboContract} onChange={(e) => setEkuboContract(e.target.value)} />
-          </div>
-          <div className="field">
-            <label htmlFor="pragma-url">Pragma API base URL</label>
-            <input id="pragma-url" value={pragmaBaseUrl} onChange={(e) => setPragmaBaseUrl(e.target.value)} placeholder="https://..." />
-          </div>
-          <div className="field">
-            <label htmlFor="rpc-url">Starknet RPC URL</label>
-            <input id="rpc-url" value={rpcUrl} onChange={(e) => setRpcUrl(e.target.value)} placeholder="https://.../rpc/v0_8" />
-          </div>
-          <div className="field">
-            <label htmlFor="pragma-pair">Pragma pair</label>
-            <input id="pragma-pair" value={pragmaPair} onChange={(e) => setPragmaPair(e.target.value)} placeholder="ETH/USD" />
-          </div>
-          <div className="field">
-            <label htmlFor="lookback">Lookback blocks</label>
-            <input id="lookback" value={lookbackBlocks} onChange={(e) => setLookbackBlocks(e.target.value)} />
-          </div>
-        </div>
-        <button
-          className="primary-button"
-          disabled={!activeAddress || bridgeLoading}
-          onClick={() => {
-            void fetchRecentTransactions('manual');
-          }}
-        >
-          {bridgeLoading ? 'Fetching…' : 'Fetch Recent Transactions'}
-        </button>
-
         {bridgeNotice && <p className="note">{bridgeNotice}</p>}
         {bridgeError && <div className="error-message">{bridgeError}</div>}
       </section>
@@ -534,7 +351,24 @@ function isSnapChunkLoadError(message: string): boolean {
   return lower.includes('loading chunk') && lower.includes('snaps.consensys.io');
 }
 
-function isLikelyStarknetAddress(value: string): boolean {
-  const trimmed = value.trim().toLowerCase();
-  return /^0x[0-9a-f]{20,66}$/.test(trimmed);
+function buildAutoFetchConfig(): AutoFetchConfig {
+  const lookbackRaw = Number(import.meta.env.VITE_LOOKBACK_BLOCKS ?? '1200');
+  const lookbackBlocks = Number.isFinite(lookbackRaw) && lookbackRaw > 0 ? Math.floor(lookbackRaw) : 1200;
+
+  const protocols: SwapProtocolConfig[] = [
+    ...(import.meta.env.VITE_JEDISWAP_CONTRACT
+      ? [{ name: 'Jediswap', contractAddress: String(import.meta.env.VITE_JEDISWAP_CONTRACT), eventNames: ['Swap'] }]
+      : []),
+    ...(import.meta.env.VITE_EKUBO_CONTRACT
+      ? [{ name: 'Ekubo', contractAddress: String(import.meta.env.VITE_EKUBO_CONTRACT), eventNames: ['Swap'] }]
+      : []),
+  ];
+
+  return {
+    rpcUrl: String(import.meta.env.VITE_RPC_URL ?? 'https://starknet-mainnet.public.blastapi.io/rpc/v0_8'),
+    pragmaBaseUrl: String(import.meta.env.VITE_PRAGMA_BASE_URL ?? ''),
+    pragmaPair: String(import.meta.env.VITE_PRAGMA_PAIR ?? 'ETH/USD'),
+    lookbackBlocks,
+    protocols,
+  };
 }
