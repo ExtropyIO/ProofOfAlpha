@@ -17,6 +17,7 @@ type AutoFetchConfig = {
 
 function App() {
   const [connectedAddress, setConnectedAddress] = useState('');
+  const [manualAddress, setManualAddress] = useState('');
   const [walletLabel, setWalletLabel] = useState('');
   const [walletLoading, setWalletLoading] = useState(false);
   const [walletError, setWalletError] = useState<string | null>(null);
@@ -61,18 +62,37 @@ function App() {
       setWalletError(null);
       setBridgeError(null);
       setBridgeNotice(null);
+      let wallet: StarknetWindowObject | null = null;
+      const injectedProvider = getInjectedMetaMaskSnap();
+
+      if (injectedProvider) {
+        // Prefer direct injected provider to avoid remote wallet loader chunk failures.
+        const accounts = await requestAccountsWithFallbacks(injectedProvider);
+        if (!accounts.length) {
+          throw new Error('Injected Starknet provider returned no accounts.');
+        }
+        setConnectedAddress(accounts[0]);
+        setWalletLabel(injectedProvider.name || 'MetaMask Starknet');
+        return;
+      }
+
       await requestStarknetSnapFromMetaMask();
 
-      let wallet: StarknetWindowObject | null = null;
-      try {
-        wallet = await connectUsingInjectedMetaMaskSnap();
-      } catch {
-        wallet = null;
+      const injectedAfterRequest = getInjectedMetaMaskSnap();
+      if (injectedAfterRequest) {
+        const accounts = await requestAccountsWithFallbacks(injectedAfterRequest);
+        if (!accounts.length) {
+          throw new Error('Starknet Snap was detected but no accounts were returned.');
+        }
+        setConnectedAddress(accounts[0]);
+        setWalletLabel(injectedAfterRequest.name || 'MetaMask Starknet');
+        return;
       }
-      if (!wallet) wallet = await connectUsingCoreWalletFlow();
+
+      wallet = await connectUsingCoreWalletFlow();
 
       if (!wallet) {
-        throw new Error('Could not connect through Starknet Snap provider. Verify MetaMask Snap permissions and retry.');
+        throw new Error('Could not detect a Starknet wallet provider. Open MetaMask Snap tab and refresh this page, then retry.');
       }
 
       const accounts = await requestAccountsWithFallbacks(wallet);
@@ -85,7 +105,7 @@ function App() {
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       setWalletError(isSnapChunkLoadError(raw)
-        ? 'MetaMask Starknet Snap failed to load required remote assets. Please retry and verify snaps.consensys.io access.'
+        ? 'MetaMask Starknet Snap failed to load required remote assets. Check snaps.consensys.io access, then retry. You can also use manual address fallback below.'
         : raw);
     } finally {
       setWalletLoading(false);
@@ -182,6 +202,35 @@ function App() {
         {walletError && <div className="error-message">{walletError}</div>}
         {bridgeNotice && <p className="note">{bridgeNotice}</p>}
         {bridgeError && <div className="error-message">{bridgeError}</div>}
+
+        {!activeAddress && (
+          <div className="manual-address-row">
+            <div className="field">
+              <label htmlFor="manual-address">Manual Starknet address (fallback)</label>
+              <input
+                id="manual-address"
+                value={manualAddress}
+                onChange={(e) => setManualAddress(e.target.value)}
+                placeholder="0x..."
+              />
+            </div>
+            <button
+              className="secondary-button"
+              onClick={() => {
+                const candidate = manualAddress.trim();
+                if (!isLikelyStarknetAddress(candidate)) {
+                  setWalletError('Enter a valid Starknet address (0x...) for manual mode.');
+                  return;
+                }
+                setWalletError(null);
+                setConnectedAddress(candidate);
+                setWalletLabel('Manual Address');
+              }}
+            >
+              Use Address
+            </button>
+          </div>
+        )}
       </section>
 
       <section className="card">
@@ -283,8 +332,26 @@ function pickPreferredWallet(wallets: StarknetWindowObject[]): StarknetWindowObj
 
 function getInjectedMetaMaskSnap(): StarknetWindowObject | null {
   if (typeof window === 'undefined') return null;
-  const injected = (window as unknown as { starknet_metamask?: StarknetWindowObject }).starknet_metamask;
-  return injected ?? null;
+  const w = window as unknown as Record<string, unknown>;
+
+  const directCandidates = [
+    w.starknet_metamask,
+    w.starknet,
+  ];
+  for (const candidate of directCandidates) {
+    if (isStarknetProvider(candidate)) {
+      return candidate;
+    }
+  }
+
+  for (const [key, value] of Object.entries(w)) {
+    if (!key.toLowerCase().includes('starknet')) continue;
+    if (isStarknetProvider(value)) {
+      return value;
+    }
+  }
+
+  return null;
 }
 
 function getEthereumProvider():
@@ -298,6 +365,10 @@ function getEthereumProvider():
 }
 
 async function requestStarknetSnapFromMetaMask(): Promise<boolean> {
+  if (getInjectedMetaMaskSnap()?.request) {
+    return true;
+  }
+
   const ethereum = getEthereumProvider();
   if (!ethereum?.request) return false;
 
@@ -343,12 +414,40 @@ async function requestAccountsWithFallbacks(wallet: StarknetWindowObject): Promi
     }
   }
 
+  const legacyAccounts = await tryLegacyEnable(wallet);
+  if (legacyAccounts.length > 0) {
+    return legacyAccounts;
+  }
+
   throw new Error(`wallet_requestAccounts failed for all payload variants: ${errors.join(' | ')}`);
 }
 
 function isSnapChunkLoadError(message: string): boolean {
   const lower = message.toLowerCase();
   return lower.includes('loading chunk') && lower.includes('snaps.consensys.io');
+}
+
+function isLikelyStarknetAddress(value: string): boolean {
+  return /^0x[0-9a-fA-F]{20,66}$/.test(value.trim());
+}
+
+function isStarknetProvider(value: unknown): value is StarknetWindowObject {
+  if (!value || typeof value !== 'object') return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.request === 'function' && typeof v.name === 'string';
+}
+
+async function tryLegacyEnable(wallet: StarknetWindowObject): Promise<string[]> {
+  const maybeLegacy = wallet as unknown as { enable?: () => Promise<string[] | void> };
+  if (typeof maybeLegacy.enable !== 'function') return [];
+
+  try {
+    const accounts = await maybeLegacy.enable();
+    return Array.isArray(accounts) ? accounts : [];
+  } catch (error) {
+    console.warn('Legacy wallet.enable() fallback failed.', error);
+    return [];
+  }
 }
 
 function buildAutoFetchConfig(): AutoFetchConfig {
