@@ -1,8 +1,4 @@
-/**
- * CRS (Common Reference String) fetch fallback.
- * @aztec/bb.js uses https://crs.aztec.network by default, which is often unreachable.
- * This module tries more reliable CDN URLs first (same as Makefile download-crs).
- */
+// CRS fetch with CDN fallback — default crs.aztec.network is frequently down
 
 const CRS_BASE_URLS = [
   'https://crs.aztec-cdn.foundation',

@@ -1,9 +1,17 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import './App.css';
-import { RpcProvider } from 'starknet';
+import { RpcProvider, Contract } from 'starknet';
 import { disconnect } from '@starknet-io/get-starknet';
 import { getStarknet, type StarknetWindowObject } from '@starknet-io/get-starknet-core';
-import { TransactionFetcher, type SwapProtocolConfig, type SwapWithPrice } from './services/TransactionFetcher';
+import {
+  TransactionFetcher,
+  computeTradeRoiSummary,
+  type SwapProtocolConfig,
+  type SwapWithPrice,
+  type TradeRoiSummary,
+} from './services/TransactionFetcher';
+import { generateRoiProof, verifyRoiProof, type RoiProofResult } from './services/ProofGenerator';
+import { ProofState } from './types';
 
 const STARKNET_SNAP_ID = 'npm:@consensys/starknet-snap';
 
@@ -27,6 +35,19 @@ function App() {
   const [bridgeError, setBridgeError] = useState<string | null>(null);
   const [bridgeNotice, setBridgeNotice] = useState<string | null>(null);
   const [bridgeRows, setBridgeRows] = useState<SwapWithPrice[]>([]);
+
+  const [roiSummary, setRoiSummary] = useState<TradeRoiSummary | null>(null);
+  const [thresholdBps, setThresholdBps] = useState(500);
+  const [proofState, setProofState] = useState<ProofState>(ProofState.Initial);
+  const [proofProgress, setProofProgress] = useState('');
+  const [proofError, setProofError] = useState<string | null>(null);
+  const [proofResult, setProofResult] = useState<RoiProofResult | null>(null);
+  const [localVerified, setLocalVerified] = useState<boolean | null>(null);
+
+  const [onChainLoading, setOnChainLoading] = useState(false);
+  const [onChainResult, setOnChainResult] = useState<boolean | null>(null);
+  const [onChainError, setOnChainError] = useState<string | null>(null);
+  const [onChainTxHash, setOnChainTxHash] = useState<string | null>(null);
 
   const autoFetchConfig = useMemo(buildAutoFetchConfig, []);
   const activeAddress = connectedAddress.trim();
@@ -68,11 +89,8 @@ function App() {
       const injectedProvider = getInjectedMetaMaskSnap();
 
       if (injectedProvider) {
-        // Prefer direct injected provider to avoid remote wallet loader chunk failures.
         const accounts = await requestAccountsWithFallbacks(injectedProvider);
-        if (!accounts.length) {
-          throw new Error('Injected Starknet provider returned no accounts.');
-        }
+        if (!accounts.length) throw new Error('Injected Starknet provider returned no accounts.');
         setConnectedAddress(accounts[0]);
         setWalletLabel(injectedProvider.name || 'MetaMask Starknet');
         return;
@@ -83,31 +101,24 @@ function App() {
       const injectedAfterRequest = getInjectedMetaMaskSnap();
       if (injectedAfterRequest) {
         const accounts = await requestAccountsWithFallbacks(injectedAfterRequest);
-        if (!accounts.length) {
-          throw new Error('Starknet Snap was detected but no accounts were returned.');
-        }
+        if (!accounts.length) throw new Error('Starknet Snap detected but no accounts returned.');
         setConnectedAddress(accounts[0]);
         setWalletLabel(injectedAfterRequest.name || 'MetaMask Starknet');
         return;
       }
 
       wallet = await connectUsingCoreWalletFlow();
-
-      if (!wallet) {
-        throw new Error('Could not detect a Starknet wallet provider. Open MetaMask Snap tab and refresh this page, then retry.');
-      }
+      if (!wallet) throw new Error('No Starknet wallet detected. Open MetaMask Snap tab and refresh.');
 
       const accounts = await requestAccountsWithFallbacks(wallet);
-      if (!accounts || accounts.length === 0) {
-        throw new Error('Wallet connected but no Starknet accounts were returned.');
-      }
+      if (!accounts || accounts.length === 0) throw new Error('Wallet connected but no accounts returned.');
 
       setConnectedAddress(accounts[0]);
       setWalletLabel(wallet.name);
     } catch (error) {
       const raw = error instanceof Error ? error.message : String(error);
       setWalletError(isSnapChunkLoadError(raw)
-        ? 'MetaMask Starknet Snap failed to load required remote assets. Check snaps.consensys.io access, then retry. You can also use manual address fallback below.'
+        ? 'MetaMask Starknet Snap failed to load remote assets. Check snaps.consensys.io access, or use manual address below.'
         : raw);
     } finally {
       setWalletLoading(false);
@@ -136,13 +147,11 @@ function App() {
       setBridgeLoading(true);
       setBridgeError(null);
       setBridgeNotice(null);
-      if (mode === 'manual') {
-        setBridgeRows([]);
-      }
+      if (mode === 'manual') setBridgeRows([]);
 
       if (!activeAddress) throw new Error('Connect wallet first.');
-      if (!autoFetchConfig.protocols.length) throw new Error('Backend config missing: no protocol contracts configured.');
-      if (!autoFetchConfig.rpcUrl) throw new Error('Backend config missing: RPC URL.');
+      if (!autoFetchConfig.protocols.length) throw new Error('No protocol contracts configured.');
+      if (!autoFetchConfig.rpcUrl) throw new Error('RPC URL not configured.');
 
       const fetcher = createFetcher();
       const rows = await fetcher.fetchRecentSwapsWithPragma({
@@ -151,7 +160,18 @@ function App() {
       });
 
       setBridgeRows(rows);
-      setBridgeNotice(`Loaded ${rows.length} recent swaps automatically.`);
+      setBridgeNotice(`Loaded ${rows.length} recent swaps.`);
+
+      const summary = computeTradeRoiSummary(rows);
+      setRoiSummary(summary);
+
+      setProofState(ProofState.Initial);
+      setProofResult(null);
+      setProofError(null);
+      setLocalVerified(null);
+      setOnChainResult(null);
+      setOnChainError(null);
+      setOnChainTxHash(null);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (mode === 'auto') {
@@ -164,12 +184,111 @@ function App() {
     }
   };
 
+  const handleGenerateProof = async () => {
+    if (!roiSummary?.proofInputHint) return;
+    try {
+      setProofState(ProofState.GeneratingWitness);
+      setProofError(null);
+      setProofResult(null);
+      setLocalVerified(null);
+      setOnChainResult(null);
+      setOnChainError(null);
+      setOnChainTxHash(null);
+
+      const inputs = {
+        totalIn: BigInt(roiSummary.proofInputHint.totalIn),
+        totalOut: BigInt(roiSummary.proofInputHint.totalOut),
+        thresholdBps,
+        tradeCount: roiSummary.proofInputHint.tradeCount,
+      };
+
+      const result = await generateRoiProof(inputs, (stage) => {
+        setProofProgress(stage);
+        if (stage.toLowerCase().includes('proof')) setProofState(ProofState.GeneratingProof);
+      });
+
+      setProofResult(result);
+      setProofState(ProofState.ProofVerified);
+
+      try {
+        const valid = await verifyRoiProof(result.proof, result.publicInputs);
+        setLocalVerified(valid);
+      } catch (verifyErr) {
+        console.warn('Local verification failed:', verifyErr);
+        setLocalVerified(null);
+      }
+    } catch (error) {
+      setProofError(error instanceof Error ? error.message : String(error));
+      setProofState(ProofState.Initial);
+    }
+  };
+
+  const handleOnChainVerify = async () => {
+    if (!proofResult) return;
+    try {
+      setOnChainLoading(true);
+      setOnChainError(null);
+      setOnChainResult(null);
+      setOnChainTxHash(null);
+      setProofState(ProofState.PreparingCalldata);
+
+      const garaga = await import('garaga');
+      const piBytes = publicInputsToBytes(proofResult.publicInputs);
+
+      const vkResponse = await fetch(new URL('../assets/vk.bin', import.meta.url).href);
+      if (!vkResponse.ok) throw new Error('Failed to load vk.bin');
+      const vkBytes = new Uint8Array(await vkResponse.arrayBuffer());
+
+      const calldata = garaga.getZKHonkCallData(proofResult.proof, piBytes, vkBytes);
+
+      setProofState(ProofState.SendingTransaction);
+
+      const verifierAddress = import.meta.env.VITE_VERIFIER_ADDRESS;
+      if (!verifierAddress) throw new Error('VITE_VERIFIER_ADDRESS not set — deploy the verifier first.');
+
+      const provider = new RpcProvider({ nodeUrl: autoFetchConfig.rpcUrl });
+      const verifierAbi = [{
+        name: 'verify_ultra_keccak_zk_honk_proof',
+        type: 'function',
+        inputs: [{ name: 'full_proof_with_hints', type: 'core::array::Span::<core::felt252>' }],
+        outputs: [{ type: 'core::option::Option::<core::bool>' }],
+        state_mutability: 'view',
+      }];
+
+      const verifierContract = new Contract({
+        abi: verifierAbi,
+        address: verifierAddress,
+        providerOrAccount: provider,
+      } as ConstructorParameters<typeof Contract>[0]);
+
+      const result = await verifierContract.call('verify_ultra_keccak_zk_honk_proof', [calldata]);
+      const verified = extractVerificationResult(result);
+      setOnChainResult(verified);
+      setOnChainTxHash(null);
+      setProofState(ProofState.ProofVerified);
+    } catch (error) {
+      setOnChainError(error instanceof Error ? error.message : String(error));
+      setProofState(ProofState.ProofVerified);
+    } finally {
+      setOnChainLoading(false);
+    }
+  };
+
+  const roiBpsDisplay = roiSummary?.roiBps !== null && roiSummary?.roiBps !== undefined
+    ? (roiSummary.roiBps / 100).toFixed(2)
+    : null;
+
+  const canProve = roiSummary?.proofInputHint !== null &&
+    roiSummary?.proofInputHint !== undefined &&
+    proofState !== ProofState.GeneratingWitness &&
+    proofState !== ProofState.GeneratingProof;
+
   return (
     <div className="simple-shell">
       <header className="simple-header">
-        <p className="eyebrow">Scaffold Garaga</p>
+        <p className="eyebrow">Proof of Alpha</p>
         <h1>Connect Wallet to Load Recent Transactions</h1>
-        <p>Transaction fetch configuration is managed on backend/env. Connect wallet to load recent swaps automatically.</p>
+        <p>Connect your wallet to auto-fetch recent swaps and prove your trading ROI on-chain.</p>
       </header>
 
       <section className="card">
@@ -188,9 +307,7 @@ function App() {
               <button
                 className="secondary-button"
                 disabled={bridgeLoading}
-                onClick={() => {
-                  void fetchRecentTransactions('manual');
-                }}
+                onClick={() => { void fetchRecentTransactions('manual'); }}
               >
                 {bridgeLoading ? 'Refreshing…' : 'Refresh'}
               </button>
@@ -221,7 +338,7 @@ function App() {
               onClick={() => {
                 const candidate = manualAddress.trim();
                 if (!isLikelyStarknetAddress(candidate)) {
-                  setWalletError('Enter a valid Starknet address (0x...) for manual mode.');
+                  setWalletError('Enter a valid Starknet address (0x…).');
                   return;
                 }
                 setWalletError(null);
@@ -273,6 +390,137 @@ function App() {
           </div>
         )}
       </section>
+
+      {roiSummary && (
+        <section className="card">
+          <h2>ROI Summary</h2>
+          <div className="roi-stats">
+            <div className="roi-stat">
+              <span className="roi-label">Trades</span>
+              <span className="roi-value">{roiSummary.tradeCount}</span>
+            </div>
+            <div className="roi-stat">
+              <span className="roi-label">Priced Trades</span>
+              <span className="roi-value">{roiSummary.pricedTradeCount}</span>
+            </div>
+            <div className="roi-stat">
+              <span className="roi-label">Winning Trades</span>
+              <span className="roi-value">{roiSummary.winningTradeCount}</span>
+            </div>
+            <div className="roi-stat">
+              <span className="roi-label">Win Rate</span>
+              <span className="roi-value">
+                {roiSummary.winRateBps !== null ? `${(roiSummary.winRateBps / 100).toFixed(1)}%` : '-'}
+              </span>
+            </div>
+            <div className="roi-stat">
+              <span className="roi-label">ROI</span>
+              <span className={`roi-value ${roiBpsDisplay !== null ? (Number(roiBpsDisplay) >= 0 ? 'positive' : 'negative') : ''}`}>
+                {roiBpsDisplay !== null ? `${roiBpsDisplay}%` : '-'}
+              </span>
+            </div>
+            <div className="roi-stat">
+              <span className="roi-label">Total In (raw)</span>
+              <span className="roi-value mono">{shortHex(roiSummary.totalInRaw, 12, 8)}</span>
+            </div>
+            <div className="roi-stat">
+              <span className="roi-label">Total Out (raw)</span>
+              <span className="roi-value mono">{shortHex(roiSummary.totalOutRaw, 12, 8)}</span>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {roiSummary && roiSummary.proofInputHint && (
+        <section className="card">
+          <h2>Prove ROI Threshold</h2>
+          <p className="note">
+            Generate a ZK proof that your ROI exceeds a threshold without revealing exact amounts.
+          </p>
+
+          <div className="threshold-row">
+            <div className="field">
+              <label htmlFor="threshold-bps">Threshold (basis points)</label>
+              <input
+                id="threshold-bps"
+                type="number"
+                min={0}
+                max={100000}
+                step={100}
+                value={thresholdBps}
+                onChange={(e) => setThresholdBps(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+              />
+              <span className="field-hint">{(thresholdBps / 100).toFixed(2)}%</span>
+            </div>
+            <button
+              className="primary-button"
+              disabled={!canProve}
+              onClick={() => { void handleGenerateProof(); }}
+            >
+              {proofState === ProofState.GeneratingWitness || proofState === ProofState.GeneratingProof
+                ? proofProgress || 'Generating…'
+                : 'Generate Proof'}
+            </button>
+          </div>
+
+          {proofError && <div className="error-message">{proofError}</div>}
+
+          {proofResult && (
+            <div className="proof-result">
+              <h3>Proof Generated</h3>
+              <div className="proof-meta">
+                <span>Time: {proofResult.elapsedMs}ms</span>
+                <span>Size: {proofResult.proof.length} bytes</span>
+                <span>Public inputs: {proofResult.publicInputs.length}</span>
+                {localVerified !== null && (
+                  <span className={localVerified ? 'positive' : 'negative'}>
+                    Local verify: {localVerified ? 'VALID' : 'INVALID'}
+                  </span>
+                )}
+              </div>
+              <details>
+                <summary>Raw proof (hex)</summary>
+                <pre className="proof-hex">
+                  {Array.from(proofResult.proof).map((b) => b.toString(16).padStart(2, '0')).join('')}
+                </pre>
+              </details>
+              <details>
+                <summary>Public inputs</summary>
+                <pre className="proof-hex">
+                  {proofResult.publicInputs.map((pi, i) => `[${i}] ${pi}`).join('\n')}
+                </pre>
+              </details>
+            </div>
+          )}
+        </section>
+      )}
+
+      {proofResult && (
+        <section className="card">
+          <h2>On-Chain Verification</h2>
+          <p className="note">
+            Submit the proof to the deployed verifier contract on Starknet.
+          </p>
+          <button
+            className="primary-button"
+            disabled={onChainLoading}
+            onClick={() => { void handleOnChainVerify(); }}
+          >
+            {onChainLoading ? 'Verifying on-chain…' : 'Verify On-Chain'}
+          </button>
+
+          {onChainError && <div className="error-message">{onChainError}</div>}
+
+          {onChainResult !== null && (
+            <div className={`on-chain-result ${onChainResult ? 'positive' : 'negative'}`}>
+              On-chain verification: {onChainResult ? 'VALID' : 'INVALID'}
+              {onChainTxHash && (
+                <span className="mono"> (tx: {shortHex(onChainTxHash)})</span>
+              )}
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 }
@@ -291,7 +539,7 @@ async function connectUsingCoreWalletFlow(): Promise<StarknetWindowObject | null
       await requestAccountsWithFallbacks(enabled);
       return enabled;
     } catch (error) {
-      throw new Error(`failed to enable authorized wallet (${authorizedWallet.name}): ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error(`Failed to enable ${authorizedWallet.name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
@@ -305,14 +553,10 @@ async function connectUsingCoreWalletFlow(): Promise<StarknetWindowObject | null
 
 async function connectUsingInjectedMetaMaskSnap(): Promise<StarknetWindowObject | null> {
   const injected = getInjectedMetaMaskSnap();
-  if (!injected?.request) {
-    return null;
-  }
+  if (!injected?.request) return null;
 
   const accounts = await requestAccountsWithFallbacks(injected);
-  if (Array.isArray(accounts) && accounts.length > 0) {
-    return injected;
-  }
+  if (Array.isArray(accounts) && accounts.length > 0) return injected;
   return null;
 }
 
@@ -322,13 +566,11 @@ function normalizeWalletId(value: unknown): string {
 
 function pickPreferredWallet(wallets: StarknetWindowObject[]): StarknetWindowObject | null {
   if (!wallets.length) return null;
-
-  const metamask = wallets.find((wallet) => {
-    const id = normalizeWalletId(wallet.id);
-    const name = normalizeWalletId(wallet.name);
+  const metamask = wallets.find((w) => {
+    const id = normalizeWalletId(w.id);
+    const name = normalizeWalletId(w.name);
     return id.includes('metamask') || name.includes('metamask');
   });
-
   return metamask ?? wallets[0];
 }
 
@@ -336,21 +578,13 @@ function getInjectedMetaMaskSnap(): StarknetWindowObject | null {
   if (typeof window === 'undefined') return null;
   const w = window as unknown as Record<string, unknown>;
 
-  const directCandidates = [
-    w.starknet_metamask,
-    w.starknet,
-  ];
-  for (const candidate of directCandidates) {
-    if (isStarknetProvider(candidate)) {
-      return candidate;
-    }
+  for (const candidate of [w.starknet_metamask, w.starknet]) {
+    if (isStarknetProvider(candidate)) return candidate;
   }
 
   for (const [key, value] of Object.entries(w)) {
     if (!key.toLowerCase().includes('starknet')) continue;
-    if (isStarknetProvider(value)) {
-      return value;
-    }
+    if (isStarknetProvider(value)) return value;
   }
 
   return null;
@@ -367,25 +601,18 @@ function getEthereumProvider():
 }
 
 async function requestStarknetSnapFromMetaMask(): Promise<boolean> {
-  if (getInjectedMetaMaskSnap()?.request) {
-    return true;
-  }
+  if (getInjectedMetaMaskSnap()?.request) return true;
 
   const ethereum = getEthereumProvider();
   if (!ethereum?.request) return false;
 
   try {
-    await ethereum.request({
-      method: 'wallet_requestSnaps',
-      params: {
-        [STARKNET_SNAP_ID]: {},
-      },
-    });
+    await ethereum.request({ method: 'wallet_requestSnaps', params: { [STARKNET_SNAP_ID]: {} } });
   } catch (error) {
-    console.warn('wallet_requestSnaps failed or was rejected.', error);
+    console.warn('wallet_requestSnaps failed or rejected', error);
   }
 
-  // Give MetaMask a brief moment to inject starknet_metamask into the page context.
+  // wait for MetaMask to inject starknet_metamask
   for (let i = 0; i < 8; i += 1) {
     if (getInjectedMetaMaskSnap()?.request) return true;
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -408,20 +635,16 @@ async function requestAccountsWithFallbacks(wallet: StarknetWindowObject): Promi
   for (const attempt of attempts) {
     try {
       const accounts = await attempt();
-      if (Array.isArray(accounts) && accounts.length > 0) {
-        return accounts;
-      }
+      if (Array.isArray(accounts) && accounts.length > 0) return accounts;
     } catch (error) {
       errors.push(error instanceof Error ? error.message : String(error));
     }
   }
 
   const legacyAccounts = await tryLegacyEnable(wallet);
-  if (legacyAccounts.length > 0) {
-    return legacyAccounts;
-  }
+  if (legacyAccounts.length > 0) return legacyAccounts;
 
-  throw new Error(`wallet_requestAccounts failed for all payload variants: ${errors.join(' | ')}`);
+  throw new Error(`wallet_requestAccounts failed: ${errors.join(' | ')}`);
 }
 
 function isSnapChunkLoadError(message: string): boolean {
@@ -442,12 +665,10 @@ function isStarknetProvider(value: unknown): value is StarknetWindowObject {
 async function tryLegacyEnable(wallet: StarknetWindowObject): Promise<string[]> {
   const maybeLegacy = wallet as unknown as { enable?: () => Promise<string[] | void> };
   if (typeof maybeLegacy.enable !== 'function') return [];
-
   try {
     const accounts = await maybeLegacy.enable();
     return Array.isArray(accounts) ? accounts : [];
-  } catch (error) {
-    console.warn('Legacy wallet.enable() fallback failed.', error);
+  } catch {
     return [];
   }
 }
@@ -485,10 +706,37 @@ function buildAutoFetchConfig(): AutoFetchConfig {
   };
 }
 
+function publicInputsToBytes(publicInputs: string[]): Uint8Array {
+  const result = new Uint8Array(publicInputs.length * 32);
+  for (let i = 0; i < publicInputs.length; i++) {
+    const hex = publicInputs[i].replace(/^0x/, '').padStart(64, '0');
+    for (let j = 0; j < 32; j++) {
+      result[i * 32 + j] = parseInt(hex.substring(j * 2, j * 2 + 2), 16);
+    }
+  }
+  return result;
+}
+
 function parseCsvEnv(value: unknown): string[] {
   if (!value) return [];
-  return String(value)
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
+  return String(value).split(',').map((item) => item.trim()).filter(Boolean);
+}
+
+function extractVerificationResult(result: unknown): boolean {
+  if (typeof result === 'boolean') return result;
+  if (result === 1n || result === 1) return true;
+  if (result === 0n || result === 0) return false;
+
+  if (result && typeof result === 'object') {
+    const r = result as Record<string, unknown>;
+    if ('Some' in r) return Boolean(r.Some);
+    if (r.variant_id === 0 || r.variant_id === 0n) return Boolean(r.value ?? r[1] ?? true);
+    if ('0' in r && r['0'] !== undefined) {
+      const inner = r['0'];
+      if (typeof inner === 'boolean') return inner;
+      return inner === 1n || inner === 1;
+    }
+  }
+
+  return Boolean(result);
 }

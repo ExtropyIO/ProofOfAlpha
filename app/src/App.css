@@ -172,6 +172,136 @@ button:disabled {
   z-index: 1;
 }
 
+/* ROI Summary */
+.roi-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 0.6rem;
+}
+
+.roi-stat {
+  border: 1px solid #2a3552;
+  border-radius: 10px;
+  background: #111a2d;
+  padding: 0.6rem 0.7rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.roi-label {
+  font-size: 0.72rem;
+  color: #8996b8;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.roi-value {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #e2e9ff;
+}
+
+.roi-value.positive {
+  color: #5de0a3;
+}
+
+.roi-value.negative {
+  color: #f57e7e;
+}
+
+.roi-value.mono {
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 0.82rem;
+}
+
+/* Proof threshold row */
+.threshold-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.8rem;
+}
+
+.threshold-row .field {
+  flex: 1;
+}
+
+.field-hint {
+  font-size: 0.75rem;
+  color: #7c8ab8;
+}
+
+/* Proof result */
+.proof-result {
+  border: 1px solid #2a3552;
+  border-radius: 10px;
+  background: #111a2d;
+  padding: 0.7rem;
+}
+
+.proof-result h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
+}
+
+.proof-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.8rem;
+  font-size: 0.82rem;
+  color: #9eb0dc;
+}
+
+.proof-meta .positive {
+  color: #5de0a3;
+  font-weight: 600;
+}
+
+.proof-meta .negative {
+  color: #f57e7e;
+  font-weight: 600;
+}
+
+.proof-hex {
+  max-height: 160px;
+  overflow: auto;
+  word-break: break-all;
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  font-size: 0.72rem;
+  background: #0d1220;
+  border: 1px solid #222d47;
+  border-radius: 8px;
+  padding: 0.5rem;
+  color: #c4cfed;
+}
+
+details summary {
+  cursor: pointer;
+  font-size: 0.82rem;
+  color: #7c8ab8;
+  margin-top: 0.4rem;
+}
+
+/* On-chain result */
+.on-chain-result {
+  border-radius: 10px;
+  padding: 0.6rem 0.7rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.on-chain-result.positive {
+  background: #122e21;
+  border: 1px solid #1e5e3a;
+  color: #5de0a3;
+}
+
+.on-chain-result.negative {
+  background: #371925;
+  border: 1px solid #7f3143;
+  color: #f57e7e;
+}
+
 @media (max-width: 760px) {
   .wallet-row {
     flex-direction: column;
@@ -190,5 +320,14 @@ button:disabled {
 
   .config-grid {
     grid-template-columns: 1fr;
+  }
+
+  .threshold-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .roi-stats {
+    grid-template-columns: 1fr 1fr;
   }
 }

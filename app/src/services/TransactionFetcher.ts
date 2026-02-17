@@ -16,28 +16,15 @@ export interface SwapProtocolConfig {
   name: string;
   contractAddress: string;
   eventNames: string[];
-  /**
-   * Optional explicit event selectors (hex) for protocols whose event name
-   * does not map cleanly from a human-readable identifier.
-   */
   eventKeys?: string[];
-  /**
-   * Optional explicit event key positions where user address is expected.
-   * If omitted, the matcher falls back to "address appears in keys/data".
-   */
   userAddressKeyIndices?: number[];
   userAddressDataIndices?: number[];
-  /** Optional data positions for amount extraction. */
   amountInDataIndex?: number;
   amountOutDataIndex?: number;
 }
 
 export interface PragmaConfig {
   baseUrl: string;
-  /**
-   * Optional query params required by your Pragma endpoint setup
-   * (examples: pair, network, source).
-   */
   queryParams?: Record<string, string>;
   apiKey?: string;
   timeoutMs?: number;
@@ -72,18 +59,12 @@ export interface FetchSwapsInput {
   fromBlock?: BlockRef;
   toBlock?: BlockRef;
   chunkSize?: number;
-  /** Stop scanning after examining this many events total. Default 2000. */
   maxEventsToScan?: number;
-  /** Stop doing sender-lookup RPC calls after this many total. Default 50. */
   maxSenderLookups?: number;
 }
 
 export interface FetchRecentSwapsInput {
   userAddress: string;
-  /**
-   * Number of blocks to scan backwards from the resolved toBlock.
-   * Defaults to 1200.
-   */
   lookbackBlocks?: number;
   toBlock?: BlockRef;
   chunkSize?: number;
@@ -98,11 +79,7 @@ export interface TradeRoiSummary {
   totalOutRaw: string;
   pnlRaw: string;
   roiBps: number | null;
-  /**
-   * Suggested integers to feed the current sample circuit inputs.
-   * This is an adapter for frontend UX while the dedicated ROI circuit is pending.
-   */
-  proofInputHint: { x: number; y: number } | null;
+  proofInputHint: { totalIn: string; totalOut: string; tradeCount: number } | null;
 }
 
 export class TransactionFetcher {
@@ -212,7 +189,6 @@ export class TransactionFetcher {
           }
 
           if (totalEventsScanned >= maxEventsToScan) {
-            console.warn(`Reached maxEventsToScan (${maxEventsToScan}) for ${protocol.name}/${eventName}; stopping.`);
             hitScanLimit = true;
             break;
           }
@@ -319,14 +295,9 @@ export class TransactionFetcher {
     }));
   }
 
-  /**
-   * Scans ERC20 Transfer events on well-known token contracts, checking
-   * the data fields for the user's address. Scans in reverse (newest first)
-   * using small block windows so recent swaps surface quickly.
-   *
-   * Groups matching transfers by tx hash: any tx that has both an outgoing
-   * and incoming transfer for the user is treated as a swap.
-   */
+  // Scans ERC-20 Transfer events on well-known tokens in reverse block order.
+  // Groups transfers by tx hash — if a tx has both outgoing + incoming for the
+  // user, it's treated as a swap.
   async fetchUserSwapsViaTransfers(input: {
     userAddress: string;
     fromBlock: number;
@@ -354,7 +325,7 @@ export class TransactionFetcher {
 
     while (currentTo >= input.fromBlock) {
       if (Date.now() - startTime > maxTimeMs) {
-        console.warn(`Transfer scan timed out after ${maxTimeMs}ms. Scanned down to block ${currentTo}.`);
+        console.warn(`Transfer scan timed out after ${maxTimeMs}ms at block ${currentTo}`);
         break;
       }
 
@@ -409,7 +380,6 @@ export class TransactionFetcher {
       }
 
       currentTo = currentFrom - 1;
-
       if (allTransfers.length > 0) break;
     }
 
@@ -426,16 +396,14 @@ export class TransactionFetcher {
     for (const [txHash, transfers] of byTxHash) {
       const outgoing = transfers.filter((t) => t.direction === 'from');
       const incoming = transfers.filter((t) => t.direction === 'to');
-
       if (outgoing.length === 0 && incoming.length === 0) continue;
 
       const primary = outgoing[0] ?? incoming[0];
       const blockNumber = primary.blockNumber;
       const timestamp = await this.getBlockTimestamp(blockNumber, blockTimestampCache);
-
       const protocolName = this.identifyProtocolForTx(transfers);
-      const outSummary = outgoing.map((t) => `${t.tokenSymbol}`).join('+') || '?';
-      const inSummary = incoming.map((t) => `${t.tokenSymbol}`).join('+') || '?';
+      const outSummary = outgoing.map((t) => t.tokenSymbol).join('+') || '?';
+      const inSummary = incoming.map((t) => t.tokenSymbol).join('+') || '?';
 
       results.push({
         protocol: protocolName,
@@ -452,6 +420,7 @@ export class TransactionFetcher {
       });
     }
 
+    // Fallback: if no paired swaps found, show individual transfers
     if (results.length === 0 && allTransfers.length > 0) {
       for (const transfer of allTransfers) {
         const blockNumber = transfer.blockNumber;
@@ -494,13 +463,8 @@ export class TransactionFetcher {
   }
 
   private async resolveBlockNumber(block: BlockRef): Promise<number> {
-    if (typeof block === 'number') {
-      return Math.max(0, Math.floor(block));
-    }
-
-    if (block !== 'latest') {
-      return 0;
-    }
+    if (typeof block === 'number') return Math.max(0, Math.floor(block));
+    if (block !== 'latest') return 0;
 
     const latest = await this.provider.getBlock('latest');
     const latestBlockRaw = (latest as { block_number?: number | string }).block_number;
@@ -513,9 +477,8 @@ export class TransactionFetcher {
 
   private async fetchPragmaUpdate(timestamp: number): Promise<PragmaPriceUpdate> {
     const baseUrl = this.pragma.baseUrl.replace(/\/+$/, '');
-    if (!baseUrl) {
-      throw new Error('Pragma base URL is not configured.');
-    }
+    if (!baseUrl) throw new Error('Pragma base URL is not configured.');
+
     const url = new URL(`${baseUrl}/v1/updates/price/${timestamp}`);
     for (const [key, value] of Object.entries(this.pragma.queryParams ?? {})) {
       url.searchParams.set(key, value);
@@ -533,11 +496,7 @@ export class TransactionFetcher {
     }
 
     const payload = (await response.json()) as unknown;
-    return {
-      timestamp,
-      signature: extractSignature(payload),
-      payload,
-    };
+    return { timestamp, signature: extractSignature(payload), payload };
   }
 
   private async getBlockTimestamp(
@@ -570,16 +529,12 @@ export function computeTradeRoiSummary(swaps: SwapWithPrice[]): TradeRoiSummary 
   for (const swap of swaps) {
     const inAmount = parseRawAmount(swap.amountInRaw);
     const outAmount = parseRawAmount(swap.amountOutRaw);
-    if (inAmount === null || outAmount === null) {
-      continue;
-    }
+    if (inAmount === null || outAmount === null) continue;
 
     totalIn += inAmount;
     totalOut += outAmount;
     pricedTradeCount += 1;
-    if (outAmount > inAmount) {
-      winningTradeCount += 1;
-    }
+    if (outAmount > inAmount) winningTradeCount += 1;
   }
 
   const pnl = totalOut - totalIn;
@@ -595,14 +550,12 @@ export function computeTradeRoiSummary(swaps: SwapWithPrice[]): TradeRoiSummary 
     totalOutRaw: totalOut.toString(),
     pnlRaw: pnl.toString(),
     roiBps,
-    proofInputHint: buildProofInputHint(roiBps, pricedTradeCount),
+    proofInputHint: buildProofInputHint(totalIn, totalOut, pricedTradeCount),
   };
 }
 
 function asBlockIdentifier(block: BlockRef): BlockIdentifier {
-  if (block === 'latest') {
-    return { block_tag: 'latest' } as unknown as BlockIdentifier;
-  }
+  if (block === 'latest') return { block_tag: 'latest' } as unknown as BlockIdentifier;
   return { block_number: block } as unknown as BlockIdentifier;
 }
 
@@ -625,23 +578,18 @@ function getProtocolEventSelectors(protocol: SwapProtocolConfig): Array<{ eventN
   }));
 
   const merged = [...fromNames, ...fromExplicitKeys];
-  if (!merged.length) {
-    return [{ eventName: `${protocol.name}-all-events` }];
-  }
+  if (!merged.length) return [{ eventName: `${protocol.name}-all-events` }];
 
   const deduped = new Map<string, { eventName: string; selector?: string }>();
   for (const item of merged) {
     const key = item.selector ?? item.eventName;
-    if (!deduped.has(key)) {
-      deduped.set(key, item);
-    }
+    if (!deduped.has(key)) deduped.set(key, item);
   }
   return Array.from(deduped.values());
 }
 
 function readAmountAtIndex(data: string[], index?: number): string | undefined {
-  if (index === undefined) return undefined;
-  if (index < 0 || index >= data.length) return undefined;
+  if (index === undefined || index < 0 || index >= data.length) return undefined;
   return data[index];
 }
 
@@ -667,7 +615,6 @@ function eventContainsUserAddress(
     return explicitKeyHits || explicitDataHits;
   }
 
-  // Safe fallback while protocol-specific decoders are not finalized.
   return keys.includes(userAddress) || data.includes(userAddress);
 }
 
@@ -675,8 +622,7 @@ function extractSignature(payload: unknown): string | null {
   if (!payload || typeof payload !== 'object') return null;
   const p = payload as Record<string, unknown>;
 
-  const direct = typeof p.signature === 'string' ? p.signature : null;
-  if (direct) return direct;
+  if (typeof p.signature === 'string') return p.signature;
 
   const dataSig =
     p.data && typeof p.data === 'object' && typeof (p.data as Record<string, unknown>).signature === 'string'
@@ -690,9 +636,8 @@ function extractSignature(payload: unknown): string | null {
       : null;
   if (resultSig) return resultSig;
 
-  const signatures = p.signatures;
-  if (Array.isArray(signatures) && typeof signatures[0] === 'string') {
-    return signatures[0];
+  if (Array.isArray(p.signatures) && typeof p.signatures[0] === 'string') {
+    return p.signatures[0];
   }
 
   return null;
@@ -704,35 +649,25 @@ function parseRawAmount(value: string | undefined): bigint | null {
   if (!trimmed) return null;
 
   try {
-    if (trimmed.startsWith('0x')) {
-      return BigInt(trimmed);
-    }
-
-    if (/^-?\d+$/.test(trimmed)) {
-      return BigInt(trimmed);
-    }
+    if (trimmed.startsWith('0x')) return BigInt(trimmed);
+    if (/^-?\d+$/.test(trimmed)) return BigInt(trimmed);
   } catch {
     return null;
   }
-
   return null;
 }
 
-function buildProofInputHint(roiBps: number | null, pricedTradeCount: number): { x: number; y: number } | null {
-  if (roiBps === null) return null;
-
-  const x = clampToCircuitInput(roiBps);
-  const y = clampToCircuitInput(pricedTradeCount);
-  return { x, y };
-}
-
-function clampToCircuitInput(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  const rounded = Math.round(value);
-  const max = Number.MAX_SAFE_INTEGER;
-  if (rounded > max) return max;
-  if (rounded < -max) return -max;
-  return rounded;
+function buildProofInputHint(
+  totalIn: bigint,
+  totalOut: bigint,
+  pricedTradeCount: number,
+): { totalIn: string; totalOut: string; tradeCount: number } | null {
+  if (pricedTradeCount === 0 || totalIn <= 0n) return null;
+  return {
+    totalIn: '0x' + totalIn.toString(16),
+    totalOut: '0x' + totalOut.toString(16),
+    tradeCount: pricedTradeCount,
+  };
 }
 
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {

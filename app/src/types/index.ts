@@ -11,6 +11,5 @@ export enum ProofState {
 export interface ProofStateData {
   state: ProofState;
   error?: string;
-  /** Result of the verifier contract read call (when state is ProofVerified). */
   verificationResult?: boolean;
 }
