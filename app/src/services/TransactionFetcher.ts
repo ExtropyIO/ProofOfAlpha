@@ -2,10 +2,25 @@ import { RpcProvider, hash, type BlockIdentifier, type EventFilter } from 'stark
 
 type BlockRef = 'latest' | number;
 
+const TRANSFER_SELECTOR = '0x99cd8bde557814842a3121e8ddfd433a539b8c9f14bf31ebf108d12e6196e9';
+
+const WELL_KNOWN_TOKENS: Array<{ symbol: string; address: string }> = [
+  { symbol: 'ETH',  address: '0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7' },
+  { symbol: 'STRK', address: '0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d' },
+  { symbol: 'USDC', address: '0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8' },
+  { symbol: 'USDT', address: '0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8' },
+  { symbol: 'WBTC', address: '0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac' },
+];
+
 export interface SwapProtocolConfig {
   name: string;
   contractAddress: string;
   eventNames: string[];
+  /**
+   * Optional explicit event selectors (hex) for protocols whose event name
+   * does not map cleanly from a human-readable identifier.
+   */
+  eventKeys?: string[];
   /**
    * Optional explicit event key positions where user address is expected.
    * If omitted, the matcher falls back to "address appears in keys/data".
@@ -25,6 +40,7 @@ export interface PragmaConfig {
    */
   queryParams?: Record<string, string>;
   apiKey?: string;
+  timeoutMs?: number;
 }
 
 export interface SwapEventRecord {
@@ -56,6 +72,10 @@ export interface FetchSwapsInput {
   fromBlock?: BlockRef;
   toBlock?: BlockRef;
   chunkSize?: number;
+  /** Stop scanning after examining this many events total. Default 2000. */
+  maxEventsToScan?: number;
+  /** Stop doing sender-lookup RPC calls after this many total. Default 50. */
+  maxSenderLookups?: number;
 }
 
 export interface FetchRecentSwapsInput {
@@ -101,64 +121,104 @@ export class TransactionFetcher {
     const fromBlock = input.fromBlock ?? 0;
     const toBlock = input.toBlock ?? 'latest';
     const chunkSize = input.chunkSize ?? 200;
+    const maxEventsToScan = input.maxEventsToScan ?? 2000;
+    const maxSenderLookups = input.maxSenderLookups ?? 50;
 
     const blockTimestampCache = new Map<number, number | null>();
     const txSenderCache = new Map<string, string | null>();
     const allResults: SwapEventRecord[] = [];
+    let totalEventsScanned = 0;
+    let totalSenderLookups = 0;
 
     for (const protocol of this.protocols) {
-      for (const eventName of protocol.eventNames) {
-        const selector = hash.getSelectorFromName(eventName);
+      const selectors = getProtocolEventSelectors(protocol);
+      for (const { eventName, selector } of selectors) {
         let continuationToken: string | undefined;
+        const seenTokens = new Set<string>();
+        let hitScanLimit = false;
 
         do {
           const chunk = await this.provider.getEvents({
             address: protocol.contractAddress,
             from_block: asBlockIdentifier(fromBlock),
             to_block: asBlockIdentifier(toBlock),
-            keys: [[selector]],
+            keys: selector ? [[selector]] : undefined,
             continuation_token: continuationToken,
             chunk_size: chunkSize,
           } as EventFilter);
 
-          for (const event of chunk.events ?? []) {
+          const events = chunk.events ?? [];
+          totalEventsScanned += events.length;
+
+          const mappedEvents = events.map((event) => {
             const keys = ((event as { keys?: string[] }).keys ?? []).map(normalizeHex);
             const data = ((event as { data?: string[] }).data ?? []).map(normalizeHex);
             const txHash = String((event as { transaction_hash?: string }).transaction_hash ?? '');
+            const directMatch = eventContainsUserAddress(userAddress, keys, data, protocol);
+            return { event, keys, data, txHash, directMatch };
+          });
 
-            let isUserMatch = eventContainsUserAddress(userAddress, keys, data, protocol);
-            if (!isUserMatch && txHash) {
-              const txSender = await this.getTransactionSender(txHash, txSenderCache);
-              isUserMatch = txSender === userAddress;
+          const senderLookupsRemaining = maxSenderLookups - totalSenderLookups;
+          if (senderLookupsRemaining > 0) {
+            const txHashesNeedingSenderLookup = Array.from(new Set(
+              mappedEvents
+                .filter((item) => !item.directMatch && Boolean(item.txHash))
+                .map((item) => item.txHash),
+            )).filter((h) => !txSenderCache.has(normalizeHex(h)));
+
+            const batch = txHashesNeedingSenderLookup.slice(0, senderLookupsRemaining);
+            if (batch.length > 0) {
+              await this.resolveTransactionSenders(batch, txSenderCache);
+              totalSenderLookups += batch.length;
             }
+          }
 
-            if (!isUserMatch) {
-              continue;
-            }
+          for (const item of mappedEvents) {
+            const senderMatch =
+              !item.directMatch && item.txHash
+                ? (txSenderCache.get(normalizeHex(item.txHash)) ?? null) === userAddress
+                : false;
+            if (!item.directMatch && !senderMatch) continue;
 
-            const blockNumber = readBlockNumber(event);
+            const blockNumber = readBlockNumber(item.event);
             const timestamp = await this.getBlockTimestamp(blockNumber, blockTimestampCache);
-
-            const amountInRaw = readAmountAtIndex(data, protocol.amountInDataIndex);
-            const amountOutRaw = readAmountAtIndex(data, protocol.amountOutDataIndex);
+            const amountInRaw = readAmountAtIndex(item.data, protocol.amountInDataIndex);
+            const amountOutRaw = readAmountAtIndex(item.data, protocol.amountOutDataIndex);
 
             allResults.push({
               protocol: protocol.name,
               contractAddress: protocol.contractAddress,
               eventName,
-              txHash,
+              txHash: item.txHash,
               blockNumber,
               timestamp,
               userAddress,
               amountInRaw,
               amountOutRaw,
-              keys,
-              data,
+              keys: item.keys,
+              data: item.data,
             });
           }
 
           continuationToken = (chunk as { continuation_token?: string }).continuation_token;
+
+          if (continuationToken) {
+            if (seenTokens.has(continuationToken)) {
+              console.warn(`Repeated continuation token for ${protocol.name}/${eventName}; stopping.`);
+              continuationToken = undefined;
+            } else {
+              seenTokens.add(continuationToken);
+            }
+          }
+
+          if (totalEventsScanned >= maxEventsToScan) {
+            console.warn(`Reached maxEventsToScan (${maxEventsToScan}) for ${protocol.name}/${eventName}; stopping.`);
+            hitScanLimit = true;
+            break;
+          }
         } while (continuationToken);
+
+        if (hitScanLimit) break;
       }
     }
 
@@ -193,6 +253,15 @@ export class TransactionFetcher {
     }
   }
 
+  private async resolveTransactionSenders(
+    txHashes: string[],
+    cache: Map<string, string | null>,
+  ): Promise<void> {
+    await runWithConcurrency(txHashes, 12, async (txHash) => {
+      await this.getTransactionSender(txHash, cache);
+    });
+  }
+
   async fetchSwapsWithPragma(input: FetchSwapsInput): Promise<SwapWithPrice[]> {
     const swaps = await this.fetchSwapEvents(input);
     const uniqueTimestamps = Array.from(new Set(swaps.map((s) => s.timestamp).filter((t): t is number => t !== null)));
@@ -222,12 +291,206 @@ export class TransactionFetcher {
     const lookback = Math.max(1, input.lookbackBlocks ?? 1200);
     const fromBlock = Math.max(0, toBlockNumber - lookback);
 
-    return this.fetchSwapsWithPragma({
+    const swaps = await this.fetchUserSwapsViaTransfers({
       userAddress: input.userAddress,
       fromBlock,
       toBlock: toBlockNumber,
-      chunkSize: input.chunkSize,
+      windowSize: 1000,
+      maxTimeMs: 25_000,
     });
+
+    const uniqueTimestamps = Array.from(new Set(swaps.map((s) => s.timestamp).filter((t): t is number => t !== null)));
+    const pragmaByTimestamp = new Map<number, PragmaPriceUpdate | null>();
+    await Promise.all(
+      uniqueTimestamps.map(async (timestamp) => {
+        try {
+          const update = await this.fetchPragmaUpdate(timestamp);
+          pragmaByTimestamp.set(timestamp, update);
+        } catch (error) {
+          console.error(`Pragma fetch failed for timestamp=${timestamp}`, error);
+          pragmaByTimestamp.set(timestamp, null);
+        }
+      }),
+    );
+
+    return swaps.map((swap) => ({
+      ...swap,
+      pragma: swap.timestamp === null ? null : (pragmaByTimestamp.get(swap.timestamp) ?? null),
+    }));
+  }
+
+  /**
+   * Scans ERC20 Transfer events on well-known token contracts, checking
+   * the data fields for the user's address. Scans in reverse (newest first)
+   * using small block windows so recent swaps surface quickly.
+   *
+   * Groups matching transfers by tx hash: any tx that has both an outgoing
+   * and incoming transfer for the user is treated as a swap.
+   */
+  async fetchUserSwapsViaTransfers(input: {
+    userAddress: string;
+    fromBlock: number;
+    toBlock: number;
+    windowSize?: number;
+    maxTimeMs?: number;
+  }): Promise<SwapEventRecord[]> {
+    const userAddress = normalizeHex(input.userAddress);
+    const windowSize = input.windowSize ?? 1000;
+    const maxTimeMs = input.maxTimeMs ?? 25_000;
+    const startTime = Date.now();
+    const blockTimestampCache = new Map<number, number | null>();
+
+    interface UserTransfer {
+      tokenSymbol: string;
+      tokenAddress: string;
+      txHash: string;
+      blockNumber: number | null;
+      direction: 'from' | 'to';
+      amountRaw: string;
+    }
+
+    const allTransfers: UserTransfer[] = [];
+    let currentTo = input.toBlock;
+
+    while (currentTo >= input.fromBlock) {
+      if (Date.now() - startTime > maxTimeMs) {
+        console.warn(`Transfer scan timed out after ${maxTimeMs}ms. Scanned down to block ${currentTo}.`);
+        break;
+      }
+
+      const currentFrom = Math.max(currentTo - windowSize + 1, input.fromBlock);
+
+      for (const token of WELL_KNOWN_TOKENS) {
+        if (Date.now() - startTime > maxTimeMs) break;
+
+        try {
+          let continuationToken: string | undefined;
+          do {
+            const chunk = await this.provider.getEvents({
+              address: token.address,
+              from_block: asBlockIdentifier(currentFrom),
+              to_block: asBlockIdentifier(currentTo),
+              keys: [[TRANSFER_SELECTOR]],
+              continuation_token: continuationToken,
+              chunk_size: 1000,
+            } as EventFilter);
+
+            for (const event of chunk.events ?? []) {
+              const data = ((event as { data?: string[] }).data ?? []).map(normalizeHex);
+              if (data.length < 3) continue;
+
+              const fromAddr = data[0];
+              const toAddr = data[1];
+              const isFromUser = fromAddr === userAddress;
+              const isToUser = toAddr === userAddress;
+              if (!isFromUser && !isToUser) continue;
+
+              const txHash = String((event as { transaction_hash?: string }).transaction_hash ?? '');
+              const blockNumber = readBlockNumber(event);
+              const amountLow = BigInt(data[2] || '0x0');
+              const amountHigh = data.length > 3 ? BigInt(data[3] || '0x0') : 0n;
+              const amount = amountLow + (amountHigh << 128n);
+
+              allTransfers.push({
+                tokenSymbol: token.symbol,
+                tokenAddress: normalizeHex(token.address),
+                txHash,
+                blockNumber,
+                direction: isFromUser ? 'from' : 'to',
+                amountRaw: '0x' + amount.toString(16),
+              });
+            }
+
+            continuationToken = (chunk as { continuation_token?: string }).continuation_token;
+          } while (continuationToken && Date.now() - startTime < maxTimeMs);
+        } catch (error) {
+          console.warn(`Transfer scan failed for ${token.symbol} in blocks ${currentFrom}-${currentTo}:`, error);
+        }
+      }
+
+      currentTo = currentFrom - 1;
+
+      if (allTransfers.length > 0) break;
+    }
+
+    const byTxHash = new Map<string, UserTransfer[]>();
+    for (const transfer of allTransfers) {
+      if (!transfer.txHash) continue;
+      const key = normalizeHex(transfer.txHash);
+      const arr = byTxHash.get(key) ?? [];
+      arr.push(transfer);
+      byTxHash.set(key, arr);
+    }
+
+    const results: SwapEventRecord[] = [];
+    for (const [txHash, transfers] of byTxHash) {
+      const outgoing = transfers.filter((t) => t.direction === 'from');
+      const incoming = transfers.filter((t) => t.direction === 'to');
+
+      if (outgoing.length === 0 && incoming.length === 0) continue;
+
+      const primary = outgoing[0] ?? incoming[0];
+      const blockNumber = primary.blockNumber;
+      const timestamp = await this.getBlockTimestamp(blockNumber, blockTimestampCache);
+
+      const protocolName = this.identifyProtocolForTx(transfers);
+      const outSummary = outgoing.map((t) => `${t.tokenSymbol}`).join('+') || '?';
+      const inSummary = incoming.map((t) => `${t.tokenSymbol}`).join('+') || '?';
+
+      results.push({
+        protocol: protocolName,
+        contractAddress: '',
+        eventName: `Swap (${outSummary} -> ${inSummary})`,
+        txHash,
+        blockNumber,
+        timestamp,
+        userAddress,
+        amountInRaw: outgoing[0]?.amountRaw,
+        amountOutRaw: incoming[0]?.amountRaw,
+        keys: [],
+        data: transfers.map((t) => `${t.direction}:${t.tokenSymbol}:${t.amountRaw}`),
+      });
+    }
+
+    if (results.length === 0 && allTransfers.length > 0) {
+      for (const transfer of allTransfers) {
+        const blockNumber = transfer.blockNumber;
+        const timestamp = await this.getBlockTimestamp(blockNumber, blockTimestampCache);
+        results.push({
+          protocol: 'Transfer',
+          contractAddress: transfer.tokenAddress,
+          eventName: `${transfer.direction === 'from' ? 'Send' : 'Receive'} ${transfer.tokenSymbol}`,
+          txHash: transfer.txHash,
+          blockNumber,
+          timestamp,
+          userAddress,
+          amountInRaw: transfer.direction === 'from' ? transfer.amountRaw : undefined,
+          amountOutRaw: transfer.direction === 'to' ? transfer.amountRaw : undefined,
+          keys: [],
+          data: [`${transfer.direction}:${transfer.tokenSymbol}:${transfer.amountRaw}`],
+        });
+      }
+    }
+
+    results.sort((a, b) => {
+      const at = a.timestamp ?? Number.MAX_SAFE_INTEGER;
+      const bt = b.timestamp ?? Number.MAX_SAFE_INTEGER;
+      return bt - at;
+    });
+
+    return results;
+  }
+
+  private identifyProtocolForTx(transfers: Array<{ tokenAddress: string }>): string {
+    for (const protocol of this.protocols) {
+      const protoAddr = normalizeHex(protocol.contractAddress);
+      for (const t of transfers) {
+        if (normalizeHex(t.tokenAddress) === protoAddr) {
+          return protocol.name;
+        }
+      }
+    }
+    return 'DEX Swap';
   }
 
   private async resolveBlockNumber(block: BlockRef): Promise<number> {
@@ -250,6 +513,9 @@ export class TransactionFetcher {
 
   private async fetchPragmaUpdate(timestamp: number): Promise<PragmaPriceUpdate> {
     const baseUrl = this.pragma.baseUrl.replace(/\/+$/, '');
+    if (!baseUrl) {
+      throw new Error('Pragma base URL is not configured.');
+    }
     const url = new URL(`${baseUrl}/v1/updates/price/${timestamp}`);
     for (const [key, value] of Object.entries(this.pragma.queryParams ?? {})) {
       url.searchParams.set(key, value);
@@ -260,7 +526,8 @@ export class TransactionFetcher {
       headers['Authorization'] = `Bearer ${this.pragma.apiKey}`;
     }
 
-    const response = await fetch(url.toString(), { headers });
+    const timeoutMs = this.pragma.timeoutMs ?? 10_000;
+    const response = await fetchWithTimeout(url.toString(), { headers }, timeoutMs);
     if (!response.ok) {
       throw new Error(`Pragma request failed (${response.status} ${response.statusText})`);
     }
@@ -341,7 +608,35 @@ function asBlockIdentifier(block: BlockRef): BlockIdentifier {
 
 function normalizeHex(value: string): string {
   const v = value.toLowerCase();
-  return v.startsWith('0x') ? v : `0x${v}`;
+  const withPrefix = v.startsWith('0x') ? v : `0x${v}`;
+  const stripped = withPrefix.replace(/^0x0+/, '0x');
+  return stripped === '0x' ? '0x0' : stripped;
+}
+
+function getProtocolEventSelectors(protocol: SwapProtocolConfig): Array<{ eventName: string; selector?: string }> {
+  const fromNames = protocol.eventNames.map((eventName) => ({
+    eventName,
+    selector: hash.getSelectorFromName(eventName),
+  }));
+
+  const fromExplicitKeys = (protocol.eventKeys ?? []).map((eventKey, idx) => ({
+    eventName: `${protocol.name}-event-${idx + 1}`,
+    selector: normalizeHex(eventKey),
+  }));
+
+  const merged = [...fromNames, ...fromExplicitKeys];
+  if (!merged.length) {
+    return [{ eventName: `${protocol.name}-all-events` }];
+  }
+
+  const deduped = new Map<string, { eventName: string; selector?: string }>();
+  for (const item of merged) {
+    const key = item.selector ?? item.eventName;
+    if (!deduped.has(key)) {
+      deduped.set(key, item);
+    }
+  }
+  return Array.from(deduped.values());
 }
 
 function readAmountAtIndex(data: string[], index?: number): string | undefined {
@@ -438,4 +733,35 @@ function clampToCircuitInput(value: number): number {
   if (rounded > max) return max;
   if (rounded < -max) return -max;
   return rounded;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function runWithConcurrency<T>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (!items.length) return;
+  const width = Math.max(1, Math.floor(concurrency));
+  let cursor = 0;
+
+  const runners = Array.from({ length: Math.min(width, items.length) }, async () => {
+    while (true) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) return;
+      await worker(items[index]);
+    }
+  });
+
+  await Promise.all(runners);
 }

@@ -1,0 +1,13 @@
+1. Ekubo swap sender (tx 0xc2448d28104877051ef3b3d42e9adfcea5a67bfe9bda7cd85df0735e20b3dc)
+   Block: 6841129
+   Address: 0x6c93e6be6bfc100a808da7de8433bbd2c07edd8d52bf188b24aa491972d75a8
+
+2. Ekubo swap sender (WBTC/USDC via Ekubo, tx 0x5ef53e3fcabc98177a591e580afce565f9c55d6a62e12d0139c8789720d54f9)
+   Block: 6702382
+   Address: 0x0081fe8ef92c3446ed38ec7b3aac43152cb0de4e5556e1f7045e8ff69261e1a0
+
+Notes:
+- Address #1 has multiple Ekubo swap events in block 6841129 (ETH/STRK routes)
+- Address #2 has a WBTC/USDC swap in block 6702382
+- VITE_LOOKBACK_BLOCKS in .env must cover the gap between current block and the target block
+  (current mainnet block is ~6,869,000 so address #1 is ~28k blocks back)

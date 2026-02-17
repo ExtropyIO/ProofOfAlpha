@@ -11,6 +11,7 @@ type AutoFetchConfig = {
   rpcUrl: string;
   pragmaBaseUrl: string;
   pragmaPair?: string;
+  pragmaTimeoutMs: number;
   lookbackBlocks: number;
   protocols: SwapProtocolConfig[];
 };
@@ -53,6 +54,7 @@ function App() {
       baseUrl: autoFetchConfig.pragmaBaseUrl,
       queryParams: autoFetchConfig.pragmaPair ? { pair: autoFetchConfig.pragmaPair } : undefined,
       apiKey: import.meta.env.VITE_PRAGMA_API_KEY,
+      timeoutMs: autoFetchConfig.pragmaTimeoutMs,
     });
   };
 
@@ -451,15 +453,25 @@ async function tryLegacyEnable(wallet: StarknetWindowObject): Promise<string[]> 
 }
 
 function buildAutoFetchConfig(): AutoFetchConfig {
-  const lookbackRaw = Number(import.meta.env.VITE_LOOKBACK_BLOCKS ?? '1200');
-  const lookbackBlocks = Number.isFinite(lookbackRaw) && lookbackRaw > 0 ? Math.floor(lookbackRaw) : 1200;
+  const lookbackRaw = Number(import.meta.env.VITE_LOOKBACK_BLOCKS ?? '32000');
+  const lookbackBlocks = Number.isFinite(lookbackRaw) && lookbackRaw > 0 ? Math.floor(lookbackRaw) : 32000;
+  const pragmaTimeoutRaw = Number(import.meta.env.VITE_PRAGMA_TIMEOUT_MS ?? '10000');
+  const pragmaTimeoutMs = Number.isFinite(pragmaTimeoutRaw) && pragmaTimeoutRaw > 0 ? Math.floor(pragmaTimeoutRaw) : 10000;
+  const ekuboEventKeys = parseCsvEnv(import.meta.env.VITE_EKUBO_EVENT_KEYS);
 
   const protocols: SwapProtocolConfig[] = [
     ...(import.meta.env.VITE_JEDISWAP_CONTRACT
       ? [{ name: 'Jediswap', contractAddress: String(import.meta.env.VITE_JEDISWAP_CONTRACT), eventNames: ['Swap'] }]
       : []),
     ...(import.meta.env.VITE_EKUBO_CONTRACT
-      ? [{ name: 'Ekubo', contractAddress: String(import.meta.env.VITE_EKUBO_CONTRACT), eventNames: ['Swap'] }]
+      ? [{
+        name: 'Ekubo',
+        contractAddress: String(import.meta.env.VITE_EKUBO_CONTRACT),
+        eventNames: ['Swap'],
+        eventKeys: ekuboEventKeys.length
+          ? ekuboEventKeys
+          : ['0x157717768aca88da4ac4279765f09f4d0151823d573537fbbeb950cdbd9a870'],
+      }]
       : []),
   ];
 
@@ -467,7 +479,16 @@ function buildAutoFetchConfig(): AutoFetchConfig {
     rpcUrl: String(import.meta.env.VITE_RPC_URL ?? 'https://starknet-mainnet.public.blastapi.io/rpc/v0_8'),
     pragmaBaseUrl: String(import.meta.env.VITE_PRAGMA_BASE_URL ?? ''),
     pragmaPair: String(import.meta.env.VITE_PRAGMA_PAIR ?? 'ETH/USD'),
+    pragmaTimeoutMs,
     lookbackBlocks,
     protocols,
   };
+}
+
+function parseCsvEnv(value: unknown): string[] {
+  if (!value) return [];
+  return String(value)
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
