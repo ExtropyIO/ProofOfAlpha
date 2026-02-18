@@ -698,6 +698,7 @@ function sumTransfersToMicroUsd(
 ): bigint | null {
   let sum = 0n;
   let anyConverted = false;
+  let anyKnownButUnpriced = false;
 
   for (const t of transfers) {
     const rawAmount = parseRawAmount(t.amountRaw);
@@ -714,14 +715,18 @@ function sumTransfersToMicroUsd(
     }
 
     const series = priceSeries.get(meta.coingeckoId);
-    if (!series) continue;
-    const usdPrice = closestPrice(series, timestamp);
-    if (usdPrice === null) continue;
+    const usdPrice = series ? closestPrice(series, timestamp) : null;
+    if (usdPrice === null) {
+      anyKnownButUnpriced = true;
+      continue;
+    }
 
     sum += rawToMicroUsd(rawAmount, meta.decimals, usdPrice);
     anyConverted = true;
   }
 
+  // Don't return a partial sum when we couldn't price a known token (avoids undercounting cost)
+  if (anyKnownButUnpriced) return null;
   return anyConverted ? sum : null;
 }
 
