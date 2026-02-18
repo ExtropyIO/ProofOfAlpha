@@ -4,13 +4,22 @@ type BlockRef = 'latest' | number;
 
 const TRANSFER_SELECTOR = '0x99cd8bde557814842a3121e8ddfd433a539b8c9f14bf31ebf108d12e6196e9';
 
-const WELL_KNOWN_TOKENS: Array<{ symbol: string; address: string }> = [
-  { symbol: 'ETH',  address: '0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7' },
-  { symbol: 'STRK', address: '0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d' },
-  { symbol: 'USDC', address: '0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8' },
-  { symbol: 'USDT', address: '0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8' },
-  { symbol: 'WBTC', address: '0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac' },
+interface TokenMeta {
+  symbol: string;
+  address: string;
+  decimals: number;
+  pragmaPair: string | null; // null = stablecoin pegged at $1
+}
+
+const WELL_KNOWN_TOKENS: TokenMeta[] = [
+  { symbol: 'ETH',  address: '0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7', decimals: 18, pragmaPair: 'ETH/USD' },
+  { symbol: 'STRK', address: '0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d', decimals: 18, pragmaPair: 'STRK/USD' },
+  { symbol: 'USDC', address: '0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8', decimals: 6,  pragmaPair: null },
+  { symbol: 'USDT', address: '0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8', decimals: 6,  pragmaPair: null },
+  { symbol: 'WBTC', address: '0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac', decimals: 8,  pragmaPair: 'BTC/USD' },
 ];
+
+const TOKEN_BY_SYMBOL = new Map(WELL_KNOWN_TOKENS.map((t) => [t.symbol, t]));
 
 export interface SwapProtocolConfig {
   name: string;
@@ -52,6 +61,10 @@ export interface PragmaPriceUpdate {
 
 export interface SwapWithPrice extends SwapEventRecord {
   pragma: PragmaPriceUpdate | null;
+  amountInUsd: bigint | null;
+  amountOutUsd: bigint | null;
+  inTokenSymbol: string | null;
+  outTokenSymbol: string | null;
 }
 
 export interface FetchSwapsInput {
@@ -75,9 +88,9 @@ export interface TradeRoiSummary {
   pricedTradeCount: number;
   winningTradeCount: number;
   winRateBps: number | null;
-  totalInRaw: string;
-  totalOutRaw: string;
-  pnlRaw: string;
+  totalInUsd: string;
+  totalOutUsd: string;
+  pnlUsd: string;
   roiBps: number | null;
   proofInputHint: { totalIn: string; totalOut: string; tradeCount: number } | null;
 }
@@ -258,6 +271,10 @@ export class TransactionFetcher {
     return swaps.map((swap) => ({
       ...swap,
       pragma: swap.timestamp === null ? null : (pragmaByTimestamp.get(swap.timestamp) ?? null),
+      amountInUsd: null,
+      amountOutUsd: null,
+      inTokenSymbol: null,
+      outTokenSymbol: null,
     }));
   }
 
@@ -275,24 +292,57 @@ export class TransactionFetcher {
       maxTimeMs: 25_000,
     });
 
-    const uniqueTimestamps = Array.from(new Set(swaps.map((s) => s.timestamp).filter((t): t is number => t !== null)));
-    const pragmaByTimestamp = new Map<number, PragmaPriceUpdate | null>();
+    // Collect unique (pragmaPair, timestamp) combos we need prices for
+    const priceFetchKeys = new Set<string>();
+    for (const swap of swaps) {
+      if (swap.timestamp === null) continue;
+      for (const entry of swap.data) {
+        const parsed = parseTransferEntry(entry);
+        if (!parsed) continue;
+        const meta = TOKEN_BY_SYMBOL.get(parsed.symbol);
+        if (meta?.pragmaPair) priceFetchKeys.add(`${meta.pragmaPair}:${swap.timestamp}`);
+      }
+    }
+
+    // Fetch all needed prices in parallel, keyed by "PAIR:timestamp"
+    const priceCache = new Map<string, { price: bigint; decimals: number } | null>();
+    const firstPragma = new Map<number, PragmaPriceUpdate | null>();
     await Promise.all(
-      uniqueTimestamps.map(async (timestamp) => {
+      Array.from(priceFetchKeys).map(async (key) => {
+        const [pair, tsStr] = key.split(':');
+        const ts = Number(tsStr);
         try {
-          const update = await this.fetchPragmaUpdate(timestamp);
-          pragmaByTimestamp.set(timestamp, update);
+          const update = await this.fetchPragmaUpdate(ts, pair);
+          priceCache.set(key, extractPriceFromPayload(update.payload));
+          if (!firstPragma.has(ts)) firstPragma.set(ts, update);
         } catch (error) {
-          console.error(`Pragma fetch failed for timestamp=${timestamp}`, error);
-          pragmaByTimestamp.set(timestamp, null);
+          console.error(`Pragma fetch failed for ${key}`, error);
+          priceCache.set(key, null);
         }
       }),
     );
 
-    return swaps.map((swap) => ({
-      ...swap,
-      pragma: swap.timestamp === null ? null : (pragmaByTimestamp.get(swap.timestamp) ?? null),
-    }));
+    return swaps.map((swap) => {
+      const transfers = swap.data.map(parseTransferEntry).filter(Boolean) as ParsedTransfer[];
+      const outgoing = transfers.filter((t) => t.direction === 'from');
+      const incoming = transfers.filter((t) => t.direction === 'to');
+
+      const amountInUsd = swap.timestamp !== null
+        ? sumTransfersToMicroUsd(outgoing, swap.timestamp, priceCache)
+        : null;
+      const amountOutUsd = swap.timestamp !== null
+        ? sumTransfersToMicroUsd(incoming, swap.timestamp, priceCache)
+        : null;
+
+      return {
+        ...swap,
+        pragma: swap.timestamp === null ? null : (firstPragma.get(swap.timestamp) ?? null),
+        amountInUsd,
+        amountOutUsd,
+        inTokenSymbol: outgoing[0]?.symbol ?? null,
+        outTokenSymbol: incoming[0]?.symbol ?? null,
+      };
+    });
   }
 
   // Scans ERC-20 Transfer events on well-known tokens in reverse block order.
@@ -475,24 +525,26 @@ export class TransactionFetcher {
     return Math.max(0, Math.floor(latestBlockNumber));
   }
 
-  private async fetchPragmaUpdate(timestamp: number): Promise<PragmaPriceUpdate> {
+  private async fetchPragmaUpdate(timestamp: number, pairOverride?: string): Promise<PragmaPriceUpdate> {
     const baseUrl = this.pragma.baseUrl.replace(/\/+$/, '');
     if (!baseUrl) throw new Error('Pragma base URL is not configured.');
 
-    const url = new URL(`${baseUrl}/v1/updates/price/${timestamp}`);
-    for (const [key, value] of Object.entries(this.pragma.queryParams ?? {})) {
-      url.searchParams.set(key, value);
-    }
+    // pair = "ETH/USD" → base="ETH", quote="USD"
+    const pair = pairOverride ?? this.pragma.queryParams?.pair ?? 'ETH/USD';
+    const [base, quote] = pair.split('/');
+    const url = new URL(`${baseUrl}/onchain/${base}/${quote}`);
+    url.searchParams.set('network', 'starknet-mainnet');
+    url.searchParams.set('timestamp', String(timestamp));
 
     const headers: HeadersInit = {};
     if (this.pragma.apiKey) {
-      headers['Authorization'] = `Bearer ${this.pragma.apiKey}`;
+      headers['X-API-KEY'] = this.pragma.apiKey;
     }
 
     const timeoutMs = this.pragma.timeoutMs ?? 10_000;
     const response = await fetchWithTimeout(url.toString(), { headers }, timeoutMs);
     if (!response.ok) {
-      throw new Error(`Pragma request failed (${response.status} ${response.statusText})`);
+      throw new Error(`Pragma ${pair} request failed (${response.status} ${response.statusText})`);
     }
 
     const payload = (await response.json()) as unknown;
@@ -527,14 +579,12 @@ export function computeTradeRoiSummary(swaps: SwapWithPrice[]): TradeRoiSummary 
   let pricedTradeCount = 0;
 
   for (const swap of swaps) {
-    const inAmount = parseRawAmount(swap.amountInRaw);
-    const outAmount = parseRawAmount(swap.amountOutRaw);
-    if (inAmount === null || outAmount === null) continue;
+    if (swap.amountInUsd === null || swap.amountOutUsd === null) continue;
 
-    totalIn += inAmount;
-    totalOut += outAmount;
+    totalIn += swap.amountInUsd;
+    totalOut += swap.amountOutUsd;
     pricedTradeCount += 1;
-    if (outAmount > inAmount) winningTradeCount += 1;
+    if (swap.amountOutUsd > swap.amountInUsd) winningTradeCount += 1;
   }
 
   const pnl = totalOut - totalIn;
@@ -546,9 +596,9 @@ export function computeTradeRoiSummary(swaps: SwapWithPrice[]): TradeRoiSummary 
     pricedTradeCount,
     winningTradeCount,
     winRateBps,
-    totalInRaw: totalIn.toString(),
-    totalOutRaw: totalOut.toString(),
-    pnlRaw: pnl.toString(),
+    totalInUsd: totalIn.toString(),
+    totalOutUsd: totalOut.toString(),
+    pnlUsd: pnl.toString(),
     roiBps,
     proofInputHint: buildProofInputHint(totalIn, totalOut, pricedTradeCount),
   };
@@ -655,6 +705,88 @@ function parseRawAmount(value: string | undefined): bigint | null {
     return null;
   }
   return null;
+}
+
+interface ParsedTransfer {
+  direction: 'from' | 'to';
+  symbol: string;
+  amountRaw: string;
+}
+
+function parseTransferEntry(entry: string): ParsedTransfer | null {
+  const parts = entry.split(':');
+  if (parts.length < 3) return null;
+  const direction = parts[0] as 'from' | 'to';
+  if (direction !== 'from' && direction !== 'to') return null;
+  return { direction, symbol: parts[1], amountRaw: parts.slice(2).join(':') };
+}
+
+function extractPriceFromPayload(payload: unknown): { price: bigint; decimals: number } | null {
+  const obj = deepFindPriceFields(payload);
+  if (!obj) return null;
+  try {
+    return { price: BigInt(String(obj.price)), decimals: Number(obj.decimals) };
+  } catch {
+    return null;
+  }
+}
+
+function deepFindPriceFields(payload: unknown): { price: unknown; decimals: unknown } | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const p = payload as Record<string, unknown>;
+  if (p.price !== undefined && p.decimals !== undefined) return { price: p.price, decimals: p.decimals };
+  for (const key of ['data', 'result', '0']) {
+    const nested = p[key];
+    if (nested && typeof nested === 'object') {
+      const found = deepFindPriceFields(nested);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function convertToMicroUsd(
+  rawAmount: bigint,
+  tokenDecimals: number,
+  price: bigint,
+  priceDecimals: number,
+): bigint {
+  // result = rawAmount * price / 10^(tokenDecimals + priceDecimals - 6)
+  const scalePow = tokenDecimals + priceDecimals - 6;
+  if (scalePow <= 0) return rawAmount * price * (10n ** BigInt(-scalePow));
+  return (rawAmount * price) / (10n ** BigInt(scalePow));
+}
+
+function sumTransfersToMicroUsd(
+  transfers: ParsedTransfer[],
+  timestamp: number,
+  priceCache: Map<string, { price: bigint; decimals: number } | null>,
+): bigint | null {
+  let sum = 0n;
+  let anyConverted = false;
+
+  for (const t of transfers) {
+    const rawAmount = parseRawAmount(t.amountRaw);
+    if (rawAmount === null || rawAmount === 0n) continue;
+
+    const meta = TOKEN_BY_SYMBOL.get(t.symbol);
+    if (!meta) continue;
+
+    if (meta.pragmaPair === null) {
+      // Stablecoin — rawAmount is already in the token's smallest unit (6 decimals = micro-USD)
+      sum += rawAmount;
+      anyConverted = true;
+      continue;
+    }
+
+    const priceData = priceCache.get(`${meta.pragmaPair}:${timestamp}`);
+    if (!priceData) continue;
+
+    sum += convertToMicroUsd(rawAmount, meta.decimals, priceData.price, priceData.decimals);
+    anyConverted = true;
+  }
+
+  return anyConverted ? sum : null;
 }
 
 function buildProofInputHint(

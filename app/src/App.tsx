@@ -69,6 +69,17 @@ function App() {
     return `${value} (${new Date(value * 1000).toISOString()})`;
   };
 
+  const formatUsd = (microUsd: bigint | null | undefined): string => {
+    if (microUsd === null || microUsd === undefined) return '-';
+    const negative = microUsd < 0n;
+    const abs = negative ? -microUsd : microUsd;
+    const dollars = abs / 1_000_000n;
+    const cents = abs % 1_000_000n;
+    const centsStr = cents.toString().padStart(6, '0').slice(0, 2);
+    const formatted = `$${dollars.toLocaleString()}.${centsStr}`;
+    return negative ? `-${formatted}` : formatted;
+  };
+
   const createFetcher = () => {
     const provider = new RpcProvider({ nodeUrl: autoFetchConfig.rpcUrl });
     return new TransactionFetcher(provider, autoFetchConfig.protocols, {
@@ -367,9 +378,10 @@ function App() {
                   <th>Tx</th>
                   <th>Block</th>
                   <th>Timestamp</th>
-                  <th>Amount In</th>
-                  <th>Amount Out</th>
-                  <th>Pragma Signature</th>
+                  <th>Sold</th>
+                  <th>Bought</th>
+                  <th>In (USD)</th>
+                  <th>Out (USD)</th>
                 </tr>
               </thead>
               <tbody>
@@ -380,9 +392,10 @@ function App() {
                     <td title={row.txHash}>{shortHex(row.txHash)}</td>
                     <td>{row.blockNumber ?? '-'}</td>
                     <td title={row.timestamp === null ? '' : String(row.timestamp)}>{formatTimestamp(row.timestamp)}</td>
-                    <td title={row.amountInRaw ?? ''}>{shortHex(row.amountInRaw, 10, 8)}</td>
-                    <td title={row.amountOutRaw ?? ''}>{shortHex(row.amountOutRaw, 10, 8)}</td>
-                    <td title={row.pragma?.signature ?? ''}>{shortHex(row.pragma?.signature, 10, 8)}</td>
+                    <td title={row.amountInRaw ?? ''}>{row.inTokenSymbol ? `${shortHex(row.amountInRaw, 6, 4)} ${row.inTokenSymbol}` : shortHex(row.amountInRaw, 10, 8)}</td>
+                    <td title={row.amountOutRaw ?? ''}>{row.outTokenSymbol ? `${shortHex(row.amountOutRaw, 6, 4)} ${row.outTokenSymbol}` : shortHex(row.amountOutRaw, 10, 8)}</td>
+                    <td>{formatUsd(row.amountInUsd)}</td>
+                    <td>{formatUsd(row.amountOutUsd)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -420,12 +433,18 @@ function App() {
               </span>
             </div>
             <div className="roi-stat">
-              <span className="roi-label">Total In (raw)</span>
-              <span className="roi-value mono">{shortHex(roiSummary.totalInRaw, 12, 8)}</span>
+              <span className="roi-label">Total In</span>
+              <span className="roi-value mono">{formatUsd(BigInt(roiSummary.totalInUsd || '0'))}</span>
             </div>
             <div className="roi-stat">
-              <span className="roi-label">Total Out (raw)</span>
-              <span className="roi-value mono">{shortHex(roiSummary.totalOutRaw, 12, 8)}</span>
+              <span className="roi-label">Total Out</span>
+              <span className="roi-value mono">{formatUsd(BigInt(roiSummary.totalOutUsd || '0'))}</span>
+            </div>
+            <div className="roi-stat">
+              <span className="roi-label">PnL</span>
+              <span className={`roi-value mono ${BigInt(roiSummary.pnlUsd || '0') >= 0n ? 'positive' : 'negative'}`}>
+                {formatUsd(BigInt(roiSummary.pnlUsd || '0'))}
+              </span>
             </div>
           </div>
         </section>

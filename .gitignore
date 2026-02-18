@@ -20,3 +20,5 @@ contracts/verifier/Scarb.lock
 
 .tool-versions
 contracts/verifier/.tool-versions
+
+.DS_Store
