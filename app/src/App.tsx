@@ -17,12 +17,18 @@ const STARKNET_SNAP_ID = 'npm:@consensys/starknet-snap';
 
 type AutoFetchConfig = {
   rpcUrl: string;
-  pragmaBaseUrl: string;
-  pragmaPair?: string;
-  pragmaTimeoutMs: number;
-  lookbackBlocks: number;
   protocols: SwapProtocolConfig[];
 };
+
+function defaultFromDate(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - 7);
+  return d.toISOString().slice(0, 10);
+}
+
+function defaultToDate(): string {
+  return new Date().toISOString().slice(0, 10);
+}
 
 function App() {
   const [connectedAddress, setConnectedAddress] = useState('');
@@ -48,6 +54,9 @@ function App() {
   const [onChainResult, setOnChainResult] = useState<boolean | null>(null);
   const [onChainError, setOnChainError] = useState<string | null>(null);
   const [onChainTxHash, setOnChainTxHash] = useState<string | null>(null);
+
+  const [dateFrom, setDateFrom] = useState(defaultFromDate);
+  const [dateTo, setDateTo] = useState(defaultToDate);
 
   const autoFetchConfig = useMemo(buildAutoFetchConfig, []);
   const activeAddress = connectedAddress.trim();
@@ -82,12 +91,7 @@ function App() {
 
   const createFetcher = () => {
     const provider = new RpcProvider({ nodeUrl: autoFetchConfig.rpcUrl });
-    return new TransactionFetcher(provider, autoFetchConfig.protocols, {
-      baseUrl: autoFetchConfig.pragmaBaseUrl,
-      queryParams: autoFetchConfig.pragmaPair ? { pair: autoFetchConfig.pragmaPair } : undefined,
-      apiKey: import.meta.env.VITE_PRAGMA_API_KEY,
-      timeoutMs: autoFetchConfig.pragmaTimeoutMs,
-    });
+    return new TransactionFetcher(provider, autoFetchConfig.protocols);
   };
 
   const connectWallet = async () => {
@@ -164,10 +168,14 @@ function App() {
       if (!autoFetchConfig.protocols.length) throw new Error('No protocol contracts configured.');
       if (!autoFetchConfig.rpcUrl) throw new Error('RPC URL not configured.');
 
+      const fromTimestamp = Math.floor(new Date(dateFrom + 'T00:00:00Z').getTime() / 1000);
+      const toTimestamp = Math.floor(new Date(dateTo + 'T23:59:59Z').getTime() / 1000);
+
       const fetcher = createFetcher();
-      const rows = await fetcher.fetchRecentSwapsWithPragma({
+      const rows = await fetcher.fetchRecentSwapsWithPrices({
         userAddress: activeAddress,
-        lookbackBlocks: autoFetchConfig.lookbackBlocks,
+        fromTimestamp,
+        toTimestamp,
       });
 
       setBridgeRows(rows);
@@ -363,6 +371,32 @@ function App() {
         )}
       </section>
 
+      {activeAddress && (
+        <section className="card">
+          <h2>Date range</h2>
+          <div className="threshold-row">
+            <div className="field">
+              <label htmlFor="date-from">From</label>
+              <input
+                id="date-from"
+                type="date"
+                value={dateFrom}
+                onChange={(e) => setDateFrom(e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="date-to">To</label>
+              <input
+                id="date-to"
+                type="date"
+                value={dateTo}
+                onChange={(e) => setDateTo(e.target.value)}
+              />
+            </div>
+          </div>
+        </section>
+      )}
+
       <section className="card">
         <h2>Recent Transactions</h2>
         <p className="note">{bridgeRows.length} rows</p>
@@ -380,8 +414,8 @@ function App() {
                   <th>Timestamp</th>
                   <th>Sold</th>
                   <th>Bought</th>
-                  <th>In (USD)</th>
-                  <th>Out (USD)</th>
+                  <th>Cost (USD)</th>
+                  <th>Value (USD)</th>
                 </tr>
               </thead>
               <tbody>
@@ -394,8 +428,8 @@ function App() {
                     <td title={row.timestamp === null ? '' : String(row.timestamp)}>{formatTimestamp(row.timestamp)}</td>
                     <td title={row.amountInRaw ?? ''}>{row.inTokenSymbol ? `${shortHex(row.amountInRaw, 6, 4)} ${row.inTokenSymbol}` : shortHex(row.amountInRaw, 10, 8)}</td>
                     <td title={row.amountOutRaw ?? ''}>{row.outTokenSymbol ? `${shortHex(row.amountOutRaw, 6, 4)} ${row.outTokenSymbol}` : shortHex(row.amountOutRaw, 10, 8)}</td>
-                    <td>{formatUsd(row.amountInUsd)}</td>
-                    <td>{formatUsd(row.amountOutUsd)}</td>
+                    <td>{formatUsd(row.costUsd)}</td>
+                    <td>{formatUsd(row.currentValueUsd)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -407,6 +441,12 @@ function App() {
       {roiSummary && (
         <section className="card">
           <h2>ROI Summary</h2>
+          {bridgeRows.length > 0 && (() => {
+            const latestSnapshotTs = Math.max(...bridgeRows.map((r) => r.timestamp ?? 0), 0);
+            return latestSnapshotTs > 0 ? (
+              <p className="note">Inflows valued at {new Date(latestSnapshotTs * 1000).toISOString().replace('T', ' ').slice(0, 19)} UTC</p>
+            ) : null;
+          })()}
           <div className="roi-stats">
             <div className="roi-stat">
               <span className="roi-label">Trades</span>
@@ -417,28 +457,18 @@ function App() {
               <span className="roi-value">{roiSummary.pricedTradeCount}</span>
             </div>
             <div className="roi-stat">
-              <span className="roi-label">Winning Trades</span>
-              <span className="roi-value">{roiSummary.winningTradeCount}</span>
-            </div>
-            <div className="roi-stat">
-              <span className="roi-label">Win Rate</span>
-              <span className="roi-value">
-                {roiSummary.winRateBps !== null ? `${(roiSummary.winRateBps / 100).toFixed(1)}%` : '-'}
-              </span>
-            </div>
-            <div className="roi-stat">
               <span className="roi-label">ROI</span>
               <span className={`roi-value ${roiBpsDisplay !== null ? (Number(roiBpsDisplay) >= 0 ? 'positive' : 'negative') : ''}`}>
                 {roiBpsDisplay !== null ? `${roiBpsDisplay}%` : '-'}
               </span>
             </div>
             <div className="roi-stat">
-              <span className="roi-label">Total In</span>
-              <span className="roi-value mono">{formatUsd(BigInt(roiSummary.totalInUsd || '0'))}</span>
+              <span className="roi-label">Total Spent</span>
+              <span className="roi-value mono">{formatUsd(BigInt(roiSummary.totalSpentUsd || '0'))}</span>
             </div>
             <div className="roi-stat">
-              <span className="roi-label">Total Out</span>
-              <span className="roi-value mono">{formatUsd(BigInt(roiSummary.totalOutUsd || '0'))}</span>
+              <span className="roi-label">Portfolio Value</span>
+              <span className="roi-value mono">{formatUsd(BigInt(roiSummary.portfolioValueUsd || '0'))}</span>
             </div>
             <div className="roi-stat">
               <span className="roi-label">PnL</span>
@@ -693,10 +723,6 @@ async function tryLegacyEnable(wallet: StarknetWindowObject): Promise<string[]> 
 }
 
 function buildAutoFetchConfig(): AutoFetchConfig {
-  const lookbackRaw = Number(import.meta.env.VITE_LOOKBACK_BLOCKS ?? '32000');
-  const lookbackBlocks = Number.isFinite(lookbackRaw) && lookbackRaw > 0 ? Math.floor(lookbackRaw) : 32000;
-  const pragmaTimeoutRaw = Number(import.meta.env.VITE_PRAGMA_TIMEOUT_MS ?? '10000');
-  const pragmaTimeoutMs = Number.isFinite(pragmaTimeoutRaw) && pragmaTimeoutRaw > 0 ? Math.floor(pragmaTimeoutRaw) : 10000;
   const ekuboEventKeys = parseCsvEnv(import.meta.env.VITE_EKUBO_EVENT_KEYS);
 
   const protocols: SwapProtocolConfig[] = [
@@ -717,10 +743,6 @@ function buildAutoFetchConfig(): AutoFetchConfig {
 
   return {
     rpcUrl: String(import.meta.env.VITE_RPC_URL ?? 'https://starknet-mainnet.public.blastapi.io/rpc/v0_8'),
-    pragmaBaseUrl: String(import.meta.env.VITE_PRAGMA_BASE_URL ?? ''),
-    pragmaPair: String(import.meta.env.VITE_PRAGMA_PAIR ?? 'ETH/USD'),
-    pragmaTimeoutMs,
-    lookbackBlocks,
     protocols,
   };
 }

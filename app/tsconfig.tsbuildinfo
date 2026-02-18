@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/crs-net-fallback.ts","./src/main.tsx","./src/vite-env.d.ts","./src/services/proofgenerator.ts","./src/services/transactionfetcher.ts","./src/types/index.ts"],"version":"6.0.0-dev.20260209"}

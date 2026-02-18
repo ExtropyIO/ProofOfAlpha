@@ -8,15 +8,15 @@ interface TokenMeta {
   symbol: string;
   address: string;
   decimals: number;
-  pragmaPair: string | null; // null = stablecoin pegged at $1
+  coingeckoId: string | null; // null = stablecoin pegged at $1
 }
 
 const WELL_KNOWN_TOKENS: TokenMeta[] = [
-  { symbol: 'ETH',  address: '0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7', decimals: 18, pragmaPair: 'ETH/USD' },
-  { symbol: 'STRK', address: '0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d', decimals: 18, pragmaPair: 'STRK/USD' },
-  { symbol: 'USDC', address: '0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8', decimals: 6,  pragmaPair: null },
-  { symbol: 'USDT', address: '0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8', decimals: 6,  pragmaPair: null },
-  { symbol: 'WBTC', address: '0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac', decimals: 8,  pragmaPair: 'BTC/USD' },
+  { symbol: 'ETH',  address: '0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7', decimals: 18, coingeckoId: 'ethereum' },
+  { symbol: 'STRK', address: '0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d', decimals: 18, coingeckoId: 'starknet' },
+  { symbol: 'USDC', address: '0x053c91253bc9682c04929ca02ed00b3e423f6710d2ee7e0d5ebb06f3ecf368a8', decimals: 6,  coingeckoId: null },
+  { symbol: 'USDT', address: '0x068f5c6a61780768455de69077e07e89787839bf8166decfbf92b645209c0fb8', decimals: 6,  coingeckoId: null },
+  { symbol: 'WBTC', address: '0x03fe2b97c1fd336e750087d68b9b867997fd64a2661ff3ca5a7c771641e8e7ac', decimals: 8,  coingeckoId: 'bitcoin' },
 ];
 
 const TOKEN_BY_SYMBOL = new Map(WELL_KNOWN_TOKENS.map((t) => [t.symbol, t]));
@@ -32,10 +32,7 @@ export interface SwapProtocolConfig {
   amountOutDataIndex?: number;
 }
 
-export interface PragmaConfig {
-  baseUrl: string;
-  queryParams?: Record<string, string>;
-  apiKey?: string;
+export interface PriceConfig {
   timeoutMs?: number;
 }
 
@@ -53,16 +50,9 @@ export interface SwapEventRecord {
   data: string[];
 }
 
-export interface PragmaPriceUpdate {
-  timestamp: number;
-  signature: string | null;
-  payload: unknown;
-}
-
 export interface SwapWithPrice extends SwapEventRecord {
-  pragma: PragmaPriceUpdate | null;
-  amountInUsd: bigint | null;
-  amountOutUsd: bigint | null;
+  costUsd: bigint | null;
+  currentValueUsd: bigint | null;
   inTokenSymbol: string | null;
   outTokenSymbol: string | null;
 }
@@ -78,18 +68,18 @@ export interface FetchSwapsInput {
 
 export interface FetchRecentSwapsInput {
   userAddress: string;
-  lookbackBlocks?: number;
-  toBlock?: BlockRef;
+  fromTimestamp: number;
+  toTimestamp: number;
   chunkSize?: number;
 }
+
+const BLOCK_LOOKBACK_FOR_TIMESTAMP_FILTER = 200_000;
 
 export interface TradeRoiSummary {
   tradeCount: number;
   pricedTradeCount: number;
-  winningTradeCount: number;
-  winRateBps: number | null;
-  totalInUsd: string;
-  totalOutUsd: string;
+  totalSpentUsd: string;
+  portfolioValueUsd: string;
   pnlUsd: string;
   roiBps: number | null;
   proofInputHint: { totalIn: string; totalOut: string; tradeCount: number } | null;
@@ -98,12 +88,12 @@ export interface TradeRoiSummary {
 export class TransactionFetcher {
   private provider: RpcProvider;
   private protocols: SwapProtocolConfig[];
-  private pragma: PragmaConfig;
+  private priceConfig: PriceConfig;
 
-  constructor(provider: RpcProvider, protocols: SwapProtocolConfig[], pragma: PragmaConfig) {
+  constructor(provider: RpcProvider, protocols: SwapProtocolConfig[], priceConfig?: PriceConfig) {
     this.provider = provider;
     this.protocols = protocols;
-    this.pragma = pragma;
+    this.priceConfig = priceConfig ?? {};
   }
 
   async fetchSwapEvents(input: FetchSwapsInput): Promise<SwapEventRecord[]> {
@@ -251,40 +241,22 @@ export class TransactionFetcher {
     });
   }
 
-  async fetchSwapsWithPragma(input: FetchSwapsInput): Promise<SwapWithPrice[]> {
+  async fetchSwapsWithPrices(input: FetchSwapsInput): Promise<SwapWithPrice[]> {
     const swaps = await this.fetchSwapEvents(input);
-    const uniqueTimestamps = Array.from(new Set(swaps.map((s) => s.timestamp).filter((t): t is number => t !== null)));
-
-    const pragmaByTimestamp = new Map<number, PragmaPriceUpdate | null>();
-    await Promise.all(
-      uniqueTimestamps.map(async (timestamp) => {
-        try {
-          const update = await this.fetchPragmaUpdate(timestamp);
-          pragmaByTimestamp.set(timestamp, update);
-        } catch (error) {
-          console.error(`Pragma fetch failed for timestamp=${timestamp}`, error);
-          pragmaByTimestamp.set(timestamp, null);
-        }
-      }),
-    );
-
     return swaps.map((swap) => ({
       ...swap,
-      pragma: swap.timestamp === null ? null : (pragmaByTimestamp.get(swap.timestamp) ?? null),
-      amountInUsd: null,
-      amountOutUsd: null,
+      costUsd: null,
+      currentValueUsd: null,
       inTokenSymbol: null,
       outTokenSymbol: null,
     }));
   }
 
-  async fetchRecentSwapsWithPragma(input: FetchRecentSwapsInput): Promise<SwapWithPrice[]> {
-    const toBlockRef = input.toBlock ?? 'latest';
-    const toBlockNumber = await this.resolveBlockNumber(toBlockRef);
-    const lookback = Math.max(1, input.lookbackBlocks ?? 1200);
-    const fromBlock = Math.max(0, toBlockNumber - lookback);
+  async fetchRecentSwapsWithPrices(input: FetchRecentSwapsInput): Promise<SwapWithPrice[]> {
+    const toBlockNumber = await this.resolveBlockNumber('latest');
+    const fromBlock = Math.max(0, toBlockNumber - BLOCK_LOOKBACK_FOR_TIMESTAMP_FILTER);
 
-    const swaps = await this.fetchUserSwapsViaTransfers({
+    const rawSwaps = await this.fetchUserSwapsViaTransfers({
       userAddress: input.userAddress,
       fromBlock,
       toBlock: toBlockNumber,
@@ -292,53 +264,65 @@ export class TransactionFetcher {
       maxTimeMs: 25_000,
     });
 
-    // Collect unique (pragmaPair, timestamp) combos we need prices for
-    const priceFetchKeys = new Set<string>();
+    const swaps = rawSwaps.filter(
+      (s) =>
+        s.timestamp !== null &&
+        s.timestamp >= input.fromTimestamp &&
+        s.timestamp <= input.toTimestamp,
+    );
+
+    // Figure out which CoinGecko tokens we need and the timestamp range
+    const neededIds = new Set<string>();
+    const timestamps: number[] = [];
     for (const swap of swaps) {
       if (swap.timestamp === null) continue;
+      timestamps.push(swap.timestamp);
       for (const entry of swap.data) {
         const parsed = parseTransferEntry(entry);
         if (!parsed) continue;
         const meta = TOKEN_BY_SYMBOL.get(parsed.symbol);
-        if (meta?.pragmaPair) priceFetchKeys.add(`${meta.pragmaPair}:${swap.timestamp}`);
+        if (meta?.coingeckoId) neededIds.add(meta.coingeckoId);
       }
     }
 
-    // Fetch all needed prices in parallel, keyed by "PAIR:timestamp"
-    const priceCache = new Map<string, { price: bigint; decimals: number } | null>();
-    const firstPragma = new Map<number, PragmaPriceUpdate | null>();
-    await Promise.all(
-      Array.from(priceFetchKeys).map(async (key) => {
-        const [pair, tsStr] = key.split(':');
-        const ts = Number(tsStr);
-        try {
-          const update = await this.fetchPragmaUpdate(ts, pair);
-          priceCache.set(key, extractPriceFromPayload(update.payload));
-          if (!firstPragma.has(ts)) firstPragma.set(ts, update);
-        } catch (error) {
-          console.error(`Pragma fetch failed for ${key}`, error);
-          priceCache.set(key, null);
-        }
-      }),
-    );
+    // Fetch CoinGecko price series for each token covering the full swap range
+    // keyed by coingeckoId → sorted array of [timestamp_seconds, usd_price]
+    const priceSeries = new Map<string, Array<[number, number]>>();
+    const latestTs = timestamps.length > 0 ? Math.max(...timestamps) : 0;
+
+    if (neededIds.size > 0 && timestamps.length > 0) {
+      const minTs = Math.min(...timestamps) - 3600; // 1h buffer
+      const maxTs = latestTs + 3600;
+      const timeout = this.priceConfig.timeoutMs ?? 15_000;
+
+      await Promise.all(
+        Array.from(neededIds).map(async (coinId) => {
+          try {
+            const series = await fetchCoinGeckoPrices(coinId, minTs, maxTs, timeout);
+            priceSeries.set(coinId, series);
+          } catch (error) {
+            console.error(`CoinGecko fetch failed for ${coinId}`, error);
+          }
+        }),
+      );
+    }
 
     return swaps.map((swap) => {
       const transfers = swap.data.map(parseTransferEntry).filter(Boolean) as ParsedTransfer[];
       const outgoing = transfers.filter((t) => t.direction === 'from');
       const incoming = transfers.filter((t) => t.direction === 'to');
 
-      const amountInUsd = swap.timestamp !== null
-        ? sumTransfersToMicroUsd(outgoing, swap.timestamp, priceCache)
-        : null;
-      const amountOutUsd = swap.timestamp !== null
-        ? sumTransfersToMicroUsd(incoming, swap.timestamp, priceCache)
-        : null;
+      const costUsd =
+        swap.timestamp !== null
+          ? sumTransfersToMicroUsd(outgoing, swap.timestamp, priceSeries)
+          : null;
+      const currentValueUsd =
+        latestTs > 0 ? sumTransfersToMicroUsd(incoming, latestTs, priceSeries) : null;
 
       return {
         ...swap,
-        pragma: swap.timestamp === null ? null : (firstPragma.get(swap.timestamp) ?? null),
-        amountInUsd,
-        amountOutUsd,
+        costUsd,
+        currentValueUsd,
         inTokenSymbol: outgoing[0]?.symbol ?? null,
         outTokenSymbol: incoming[0]?.symbol ?? null,
       };
@@ -525,32 +509,6 @@ export class TransactionFetcher {
     return Math.max(0, Math.floor(latestBlockNumber));
   }
 
-  private async fetchPragmaUpdate(timestamp: number, pairOverride?: string): Promise<PragmaPriceUpdate> {
-    const baseUrl = this.pragma.baseUrl.replace(/\/+$/, '');
-    if (!baseUrl) throw new Error('Pragma base URL is not configured.');
-
-    // pair = "ETH/USD" → base="ETH", quote="USD"
-    const pair = pairOverride ?? this.pragma.queryParams?.pair ?? 'ETH/USD';
-    const [base, quote] = pair.split('/');
-    const url = new URL(`${baseUrl}/onchain/${base}/${quote}`);
-    url.searchParams.set('network', 'starknet-mainnet');
-    url.searchParams.set('timestamp', String(timestamp));
-
-    const headers: HeadersInit = {};
-    if (this.pragma.apiKey) {
-      headers['X-API-KEY'] = this.pragma.apiKey;
-    }
-
-    const timeoutMs = this.pragma.timeoutMs ?? 10_000;
-    const response = await fetchWithTimeout(url.toString(), { headers }, timeoutMs);
-    if (!response.ok) {
-      throw new Error(`Pragma ${pair} request failed (${response.status} ${response.statusText})`);
-    }
-
-    const payload = (await response.json()) as unknown;
-    return { timestamp, signature: extractSignature(payload), payload };
-  }
-
   private async getBlockTimestamp(
     blockNumber: number | null,
     cache: Map<number, number | null>,
@@ -573,34 +531,29 @@ export class TransactionFetcher {
 }
 
 export function computeTradeRoiSummary(swaps: SwapWithPrice[]): TradeRoiSummary {
-  let totalIn = 0n;
-  let totalOut = 0n;
-  let winningTradeCount = 0;
+  let totalSpent = 0n;
+  let portfolioValue = 0n;
   let pricedTradeCount = 0;
 
   for (const swap of swaps) {
-    if (swap.amountInUsd === null || swap.amountOutUsd === null) continue;
+    if (swap.costUsd === null || swap.currentValueUsd === null) continue;
 
-    totalIn += swap.amountInUsd;
-    totalOut += swap.amountOutUsd;
+    totalSpent += swap.costUsd;
+    portfolioValue += swap.currentValueUsd;
     pricedTradeCount += 1;
-    if (swap.amountOutUsd > swap.amountInUsd) winningTradeCount += 1;
   }
 
-  const pnl = totalOut - totalIn;
-  const roiBps = totalIn > 0n ? Number((pnl * 10_000n) / totalIn) : null;
-  const winRateBps = pricedTradeCount > 0 ? Math.round((winningTradeCount * 10_000) / pricedTradeCount) : null;
+  const pnl = portfolioValue - totalSpent;
+  const roiBps = totalSpent > 0n ? Number((pnl * 10_000n) / totalSpent) : null;
 
   return {
     tradeCount: swaps.length,
     pricedTradeCount,
-    winningTradeCount,
-    winRateBps,
-    totalInUsd: totalIn.toString(),
-    totalOutUsd: totalOut.toString(),
+    totalSpentUsd: totalSpent.toString(),
+    portfolioValueUsd: portfolioValue.toString(),
     pnlUsd: pnl.toString(),
     roiBps,
-    proofInputHint: buildProofInputHint(totalIn, totalOut, pricedTradeCount),
+    proofInputHint: buildProofInputHint(totalSpent, portfolioValue, pricedTradeCount),
   };
 }
 
@@ -668,29 +621,36 @@ function eventContainsUserAddress(
   return keys.includes(userAddress) || data.includes(userAddress);
 }
 
-function extractSignature(payload: unknown): string | null {
-  if (!payload || typeof payload !== 'object') return null;
-  const p = payload as Record<string, unknown>;
+const COINGECKO_BASE = 'https://api.coingecko.com/api/v3';
 
-  if (typeof p.signature === 'string') return p.signature;
+async function fetchCoinGeckoPrices(
+  coinId: string,
+  fromTs: number,
+  toTs: number,
+  timeoutMs: number,
+): Promise<Array<[number, number]>> {
+  const url = `${COINGECKO_BASE}/coins/${coinId}/market_chart/range?vs_currency=usd&from=${fromTs}&to=${toTs}`;
+  const response = await fetchWithTimeout(url, {}, timeoutMs);
+  if (!response.ok) throw new Error(`CoinGecko ${coinId} (${response.status})`);
+  const data = (await response.json()) as { prices?: Array<[number, number]> };
+  if (!Array.isArray(data.prices)) return [];
+  // API returns [timestamp_ms, price] — convert to seconds
+  return data.prices.map(([tsMs, price]) => [Math.round(tsMs / 1000), price]);
+}
 
-  const dataSig =
-    p.data && typeof p.data === 'object' && typeof (p.data as Record<string, unknown>).signature === 'string'
-      ? ((p.data as Record<string, unknown>).signature as string)
-      : null;
-  if (dataSig) return dataSig;
-
-  const resultSig =
-    p.result && typeof p.result === 'object' && typeof (p.result as Record<string, unknown>).signature === 'string'
-      ? ((p.result as Record<string, unknown>).signature as string)
-      : null;
-  if (resultSig) return resultSig;
-
-  if (Array.isArray(p.signatures) && typeof p.signatures[0] === 'string') {
-    return p.signatures[0];
+// Find the closest price to a target timestamp from a sorted series
+function closestPrice(series: Array<[number, number]>, targetTs: number): number | null {
+  if (!series.length) return null;
+  let best = series[0];
+  let bestDelta = Math.abs(best[0] - targetTs);
+  for (let i = 1; i < series.length; i++) {
+    const delta = Math.abs(series[i][0] - targetTs);
+    if (delta < bestDelta) {
+      best = series[i];
+      bestDelta = delta;
+    }
   }
-
-  return null;
+  return best[1];
 }
 
 function parseRawAmount(value: string | undefined): bigint | null {
@@ -721,46 +681,20 @@ function parseTransferEntry(entry: string): ParsedTransfer | null {
   return { direction, symbol: parts[1], amountRaw: parts.slice(2).join(':') };
 }
 
-function extractPriceFromPayload(payload: unknown): { price: bigint; decimals: number } | null {
-  const obj = deepFindPriceFields(payload);
-  if (!obj) return null;
-  try {
-    return { price: BigInt(String(obj.price)), decimals: Number(obj.decimals) };
-  } catch {
-    return null;
-  }
-}
-
-function deepFindPriceFields(payload: unknown): { price: unknown; decimals: unknown } | null {
-  if (!payload || typeof payload !== 'object') return null;
-  const p = payload as Record<string, unknown>;
-  if (p.price !== undefined && p.decimals !== undefined) return { price: p.price, decimals: p.decimals };
-  for (const key of ['data', 'result', '0']) {
-    const nested = p[key];
-    if (nested && typeof nested === 'object') {
-      const found = deepFindPriceFields(nested);
-      if (found) return found;
-    }
-  }
-  return null;
-}
-
-function convertToMicroUsd(
-  rawAmount: bigint,
-  tokenDecimals: number,
-  price: bigint,
-  priceDecimals: number,
-): bigint {
-  // result = rawAmount * price / 10^(tokenDecimals + priceDecimals - 6)
-  const scalePow = tokenDecimals + priceDecimals - 6;
-  if (scalePow <= 0) return rawAmount * price * (10n ** BigInt(-scalePow));
-  return (rawAmount * price) / (10n ** BigInt(scalePow));
+// Convert a raw token amount to micro-USD (6 decimals) using a floating-point USD price.
+// CoinGecko gives us a float like 2030.76 — we multiply by 1e6 to get micro-USD,
+// then scale down by the token's decimals.
+function rawToMicroUsd(rawAmount: bigint, tokenDecimals: number, usdPrice: number): bigint {
+  // micro-USD = rawAmount * (usdPrice * 1e6) / 10^tokenDecimals
+  const priceMicro = BigInt(Math.round(usdPrice * 1e6));
+  if (tokenDecimals <= 0) return rawAmount * priceMicro;
+  return (rawAmount * priceMicro) / (10n ** BigInt(tokenDecimals));
 }
 
 function sumTransfersToMicroUsd(
   transfers: ParsedTransfer[],
   timestamp: number,
-  priceCache: Map<string, { price: bigint; decimals: number } | null>,
+  priceSeries: Map<string, Array<[number, number]>>,
 ): bigint | null {
   let sum = 0n;
   let anyConverted = false;
@@ -772,17 +706,19 @@ function sumTransfersToMicroUsd(
     const meta = TOKEN_BY_SYMBOL.get(t.symbol);
     if (!meta) continue;
 
-    if (meta.pragmaPair === null) {
-      // Stablecoin — rawAmount is already in the token's smallest unit (6 decimals = micro-USD)
+    if (meta.coingeckoId === null) {
+      // Stablecoin — rawAmount already in micro-USD (6 decimals)
       sum += rawAmount;
       anyConverted = true;
       continue;
     }
 
-    const priceData = priceCache.get(`${meta.pragmaPair}:${timestamp}`);
-    if (!priceData) continue;
+    const series = priceSeries.get(meta.coingeckoId);
+    if (!series) continue;
+    const usdPrice = closestPrice(series, timestamp);
+    if (usdPrice === null) continue;
 
-    sum += convertToMicroUsd(rawAmount, meta.decimals, priceData.price, priceData.decimals);
+    sum += rawToMicroUsd(rawAmount, meta.decimals, usdPrice);
     anyConverted = true;
   }
 
