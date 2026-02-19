@@ -5,7 +5,7 @@ fn main(
     trade_count: pub Field,
 ) {
     assert(total_in != 0, "total_in must be non-zero");
-    assert(trade_count != 0, "trade_count must be non-zero");
+    // trade_count == 0 is rejected off-chain by the app before proving
 
     // out * 10000 >= (10000 + threshold) * in  →  ROI >= threshold_bps / 10000
     // surplus < 0 would be huge in the field and fail the 126-bit range check

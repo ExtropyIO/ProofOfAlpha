@@ -13,6 +13,7 @@ dist
 circuit/target/
 
 # Scarb build cache
+contracts/target/
 contracts/verifier/target/
 
 # Dependency lock for generated verifier contract

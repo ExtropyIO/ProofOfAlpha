@@ -205,6 +205,7 @@ function App() {
 
   const handleGenerateProof = async () => {
     if (!roiSummary?.proofInputHint) return;
+    if (roiSummary.proofInputHint.tradeCount === 0) return; // reject off-chain; circuit no longer asserts this
     try {
       setProofState(ProofState.GeneratingWitness);
       setProofError(null);
