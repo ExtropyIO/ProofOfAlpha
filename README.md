@@ -1,227 +1,176 @@
-<<<<<<< Updated upstream
-# ProofOfAlpha
-Tool to prove your DeFi track record
-=======
-# Scaffold Garaga app
+# Proof of Alpha
 
-This is a Noir+Garaga+Starknet starter with in-browser proving and a step-by-step guide how to:
-- Generate and deploy UltraHonk proof verifier contract to Starknet devnet
-- Add state to your privacy preserving app
-- Add wallet connection and deploy to public testnet
+Prove your DeFi track record on Starknet: connect a wallet, load recent swaps from Jediswap and Ekubo, see an ROI summary, and generate a zero-knowledge proof that your ROI exceeds a chosen threshold—then verify it on-chain without revealing exact amounts.
 
-## Install
+---
 
-Ensure you have node.js >= 20 installed.  
+## Architecture
 
-Bun is used for package management, install it with:
-```sh
-make install-bun
+### High-level flow
+
+1. **Frontend (React + Vite)** — Single-page app that:
+   - Connects to Starknet via wallet (MetaMask Starknet Snap or get-starknet: ArgentX, Braavos).
+   - Fetches swap events for the connected (or manually entered) address from configured protocols.
+   - Prices trades in USD using Coingecko-style data and displays an ROI summary.
+   - Generates a ZK proof in the browser (Noir + Barretenberg UltraHonk) that “ROI ≥ threshold” without revealing totals.
+   - Calls the deployed Garaga verifier contract to verify the proof on Starknet.
+
+2. **Data bridge** — `app/src/services/TransactionFetcher.ts`:
+   - Talks to Starknet RPC to get swap events from Jediswap and Ekubo (contract addresses and event keys come from env).
+   - Filters by user address, resolves block timestamps, and attaches USD pricing for in/out tokens (ETH, STRK, USDC, USDT, WBTC).
+   - Exposes `fetchRecentSwapsWithPrices()` by date range and `computeTradeRoiSummary()` for the UI and proof inputs.
+
+3. **ZK proof** — `app/src/services/ProofGenerator.ts` + Noir circuit:
+   - **Circuit** (`circuit/src/main.nr`): Public inputs `threshold_bps`, `trade_count`; private inputs `total_in`, `total_out`. Asserts  
+     `total_out * 10000 >= (10000 + threshold_bps) * total_in` (i.e. ROI ≥ threshold) with a 126-bit range check.
+   - **ProofGenerator**: Loads compiled `circuit.json`, runs Noir witness + Barretenberg UltraHonk in the browser, returns proof bytes and public inputs. Can verify locally and prepare Garaga calldata for on-chain verification.
+
+4. **Verifier (Starknet)** — Garaga-generated Cairo contract (`contracts/`):
+   - Verifies UltraHonk proofs. Deployed to devnet or testnet; frontend calls `verify_ultra_keccak_zk_honk_proof` with calldata from `garaga.getZKHonkCallData(proof, publicInputsBytes, vkBytes)`.
+
+### Frontend app structure
+
+```
+app/
+├── src/
+│   ├── App.tsx              # Main UI: wallet, date range, tx table, ROI summary, proof flow, on-chain verify
+│   ├── services/
+│   │   ├── TransactionFetcher.ts  # RPC swap fetch, pricing, ROI summary, protocol config
+│   │   └── ProofGenerator.ts      # Noir + bb.js proof generation and local verification
+│   ├── types/index.ts       # ProofState enum etc.
+│   ├── assets/              # circuit.json, vk.bin, verifier.json (copied from circuit/ and contracts/)
+│   ├── crs-net-fallback.ts  # CRS URL fallback for bb.js (proof generation)
+│   ├── main.tsx, index.css, App.css
+│   └── vite-env.d.ts
+├── vite.config.ts           # React, node polyfills, CRS rewrite, worker config for bb.js
+├── package.json             # React 19, Vite 6, starknet.js, get-starknet, Noir/bb.js/garaga
+└── .env                     # VITE_* variables (see below)
 ```
 
-For compiling Noir circuits and generating proofs we need specific versions of Aztec packages:
-```sh
-make install-noir
-make install-barretenberg
+---
+
+## Frontend setup
+
+### Prerequisites
+
+- **Node.js** ≥ 20  
+- **Bun** (recommended for install/scripts). Install: `curl -fsSL https://bun.sh/install | bash`
+
+### Install and run (app only)
+
+```bash
+cd app
+bun install
+bun run dev
 ```
 
-Starknet toolkit comes in a single bundle via asdf (the following command will install it if you don't have it):
-```sh
-make install-starknet
-```
+- Build: `bun run build`  
+- Preview production build: `bun run preview`
 
-We also need to install a tool for spawning local Starknet chain:
-```sh
-make install-devnet
-```
+### Environment variables
 
-Install Scarb and other asdf tools (required for `make gen-verifier`):
-```sh
-make update-tools
-```
+Create `app/.env` (or pass env when running). All are optional except where noted.
 
-Finally we need to install Garaga. Make sure you have Python 3.10 in your system. You may also need to start a separate Python virtual environment for this to work. You can do that with `python3.10 -m venv garaga-venv && source garaga-venv/bin/activate`. Then install with:
+| Variable                 | Description                                                                  | Example / default                                                                 |
+| ------------------------ | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `VITE_RPC_URL`           | Starknet RPC URL                                                             | `https://starknet-mainnet.public.blastapi.io/rpc/v0_8` or your Alchemy/Infura URL |
+| `VITE_JEDISWAP_CONTRACT` | Jediswap router/pool for Swap events                                         | Mainnet: `0x0359550b990167afd6635fa574f3bdadd83cb51850e1d00061fe693158c23f80`     |
+| `VITE_EKUBO_CONTRACT`    | Ekubo core contract for Swap events                                          | Mainnet: `0x00000005dd3d2f4429af886cd1a3b08289dbcea99a294197e9eb43b0e0325b4b`     |
+| `VITE_EKUBO_EVENT_KEYS`  | Comma-separated Ekubo event keys (pool IDs) to filter                        | e.g. `0x157717768aca88da4ac4279765f09f4d0151823d573537fbbeb950cdbd9a870`          |
+| `VITE_VERIFIER_ADDRESS`  | Deployed Garaga verifier contract address (required for **Verify on-chain**) | Set after `make deploy-verifier` on devnet                                        |
+| `VITE_LOOKBACK_BLOCKS`   | Max blocks to scan when resolving timestamps (TransactionFetcher)            | e.g. `32000`                                                                      |
 
-```sh
-make install-garaga
-```
+Without `VITE_VERIFIER_ADDRESS`, the app still runs: you can connect a wallet, fetch swaps, see ROI, and generate proofs; only the “Verify on-chain” button will fail until the verifier is deployed and this env is set.
 
-Note that we need specific versions of Noir, Barretenberg, and Garaga to work well together. If you are experiencing any issues with code generation, proving, and verification — first of all ensure you have the correct package versions.
+---
 
-## Tutorial
+## Test wallet and manual address
 
-This repo is organized in layers: each app iteration is a new git branch.  
+- **Connected wallet**  
+  Use “Connect Wallet” to use MetaMask Starknet Snap or get-starknet (ArgentX, Braavos). The app uses the first returned account for fetching swaps and proving.
 
-Follow the steps and checkout the necessary branch:
-1. [`master`](https://github.com/m-kus/scaffold-garaga/tree/master) — in-browser proof generation and stateless proof verification in devnet
-2. [`1-app-logic`](https://github.com/m-kus/scaffold-garaga/tree/1-app-logic) — more involved Noir circuit logic
-3. [`2-app-state`](https://github.com/m-kus/scaffold-garaga/tree/2-app-state) — extend onchain part with a storage for nullifiers
-4. [`3-testnet`](https://github.com/m-kus/scaffold-garaga/tree/3-testnet) — deploy to public Starknet testnet and interact via wallet
+- **Manual address (no wallet)**  
+  If you don’t connect a wallet, you can paste a Starknet address in “Manual Starknet address (fallback)” and click **Use Address**. The app will use that address for the data bridge and proof (same flow as with a connected wallet). Useful for testing with a known mainnet address that has history.
 
-## Run app
+- **Devnet testing**  
+  When using local devnet (`make devnet`), run `make accounts-file` to generate `contracts/accounts.json`. That file contains a predeployed account (e.g. address and private key) you can use with sncast or with a devnet-compatible wallet. Point `VITE_RPC_URL` to `http://127.0.0.1:5050/rpc` and set `VITE_VERIFIER_ADDRESS` after deploying the verifier (see below).
 
-First of all we need to build our Noir circuit:
+---
 
-```sh
+## Main app aspects
+
+1. **Wallet connection**  
+   MetaMask Starknet Snap is preferred; fallback is get-starknet (ArgentX, Braavos). Manual address entry allows using the app without any wallet for a given Starknet address.
+
+2. **Data bridge (Recent Transactions)**  
+   Fetches swap events from Jediswap and Ekubo for the chosen address and date range, resolves timestamps, and prices in/out in USD. Table shows protocol, event, tx, block, timestamp, amounts, cost (USD), and value (USD).
+
+3. **ROI summary**  
+   Aggregates trades into: trade count, priced trade count, ROI %, total spent, portfolio value, PnL. Drives the inputs for the ZK proof (total in/out, trade count).
+
+4. **Prove ROI threshold**  
+   You set a threshold in basis points (e.g. 500 = 5%). The app generates a ZK proof that your ROI is ≥ that threshold without revealing `total_in` or `total_out`. Proof is generated in-browser (Noir + Barretenberg); you can see local verification result and proof/public-input details.
+
+5. **Verify on-chain**  
+   Uses Garaga’s `getZKHonkCallData` and the deployed verifier contract to run `verify_ultra_keccak_zk_honk_proof` on Starknet. Requires `VITE_VERIFIER_ADDRESS` and the same RPC as the deployed contract (e.g. devnet or testnet).
+
+---
+
+## Building the circuit and deploying the verifier (optional)
+
+If you want to regenerate the circuit artifact and deploy the verifier yourself (e.g. for devnet):
+
+### Toolchain
+
+- **Noir** (e.g. 1.0.0-beta.16): `make install-noir`  
+- **Barretenberg** (bb, matching nightly): `make install-barretenberg`  
+- **Starknet** (sncast, scarb via asdf): `make install-starknet`  
+- **Starknet devnet**: `make install-devnet`  
+- **Garaga** (Python 3.10): `make install-garaga`  
+- **Scarb / asdf**: `make update-tools`
+
+### Build circuit and verifier
+
+```bash
 make build-circuit
+make exec-circuit    # witness from Prover.toml
+make gen-vk          # may need: make download-crs first
+make gen-verifier    # Cairo verifier from Garaga
+make build-verifier
 ```
 
-Sample inputs are already provided in `Prover.toml`, execute to generate witness:
+### Run devnet and deploy
 
-```sh
-make exec-circuit
-```
-
-Generate verification key (this will download the CRS to `~/.bb-crs` if needed):
-
-```sh
-make gen-vk
-```
-
-If you see `HTTP request failed for http://crs.aztec.network/g1.dat`, run `make download-crs` first to fetch the CRS from the CDN, then run `make gen-vk` again.
-
-Now we can generate the verifier contract in Cairo using Garaga:
-
-```sh
-make gen-verifier
-```
-
-Let's start our local development network in other terminal instance:
-
-```sh
-make devnet
-```
-
-You now need to start a new terminal window. Initialize the account we will be using for deployment:
-
-```sh
-make accounts-file
-```
-
-First we need to declare out contract ("upload" contract code):
-
-```sh
+```bash
+make devnet          # in one terminal
+make accounts-file   # in another
 make declare-verifier
+make deploy-verifier # use class hash from declare output if different from Makefile
+make artifacts       # copy circuit.json, vk.bin, verifier.json into app/src/assets/
 ```
 
-Now we can instantiate the contract class we obtained (you might need to update the command in Makefile):
+Set `VITE_VERIFIER_ADDRESS` to the deployed contract address and `VITE_RPC_URL` to `http://127.0.0.1:5050/rpc`, then run the app and use “Verify on-chain.”
 
-```sh
-make deploy-verifier
-```
-
-Great! Now let's copy necessary artifacts:
-
-```sh
-make artifacts
-```
-
-Prepare the app and its requirements so you can run it. Go to the `app` folder and:
-1. Update the contract address in the app code (change App.tsx). 
-1. Make sure you have `tsc` installed. If not, you can install it with `bun add -d typescript@next`.
-1. Install vite with `npm install -D vite`
-1. Build the app with `bun run build`
-1. Finally we can run the app: `bun run dev`
-
-## Phase 1: Data Bridge scaffold
-
-`app/src/services/TransactionFetcher.ts` now contains a frontend service for:
-- Pulling swap events from Starknet RPC (per protocol contract + event name)
-- Filtering events to a specific user address
-- Resolving block timestamps
-- Fetching Pragma historical price updates at each timestamp
-- Preserving Pragma signatures for ZK circuit inputs
-
-Example:
-
-```ts
-import { RpcProvider } from 'starknet';
-import { TransactionFetcher } from './services/TransactionFetcher';
-
-const provider = new RpcProvider({ nodeUrl: 'http://127.0.0.1:5050/rpc' });
-const fetcher = new TransactionFetcher(
-  provider,
-  [
-    {
-      name: 'Jediswap',
-      contractAddress: '0x<jediswap_pool_or_router>',
-      eventNames: ['Swap'],
-      // Update these indexes per protocol ABI:
-      userAddressKeyIndices: [1],
-      amountInDataIndex: 0,
-      amountOutDataIndex: 1,
-    },
-    {
-      name: 'Ekubo',
-      contractAddress: '0x<ekubo_contract>',
-      eventNames: ['Swap'],
-    },
-  ],
-  {
-    baseUrl: 'https://<your-pragma-host>',
-    queryParams: {
-      // Set based on your Pragma endpoint requirements
-      pair: 'ETH/USD',
-    },
-  },
-);
-
-const rows = await fetcher.fetchSwapsWithPragma({
-  userAddress: '0x<user_address>',
-  fromBlock: 0,
-  toBlock: 'latest',
-});
-
-// Each row now has swap data + pragma.signature for circuit inputs
-console.log(rows);
-```
-
-Phase 1.5 UI is wired in `app/src/App.tsx` as a **Data Bridge** panel with:
-- Starknet wallet connect button (address auto-selected from wallet)
-- block range inputs
-- protocol contract inputs (Jediswap + Ekubo)
-- Pragma URL + pair
-- table output including Pragma signature per row
-
-Optional env vars:
-- `VITE_RPC_URL`
-- `VITE_JEDISWAP_CONTRACT`
-- `VITE_EKUBO_CONTRACT`
-- `VITE_PRAGMA_BASE_URL`
-- `VITE_PRAGMA_PAIR`
-- `VITE_PRAGMA_API_KEY`
-
-## Deploy verifier to devnet (fix "Contract not found")
-
-If you see **Contract not found** when sending the transaction, the verifier is not deployed on your devnet. With devnet already running (`make devnet`), in **another terminal** run:
-
-```sh
-make accounts-file
-make declare-verifier
-```
-
-If the Makefile’s `deploy-verifier` target has a different class hash than the one printed by `declare-verifier`, edit `Makefile` and set `--class-hash` in `deploy-verifier` to the printed `contract_class_hash`. Then:
-
-```sh
-make deploy-verifier
-```
-
-Copy the **contract_address** from the output and either:
-
-- Set it when starting the app: `VITE_VERIFIER_ADDRESS=0x<your_address> bun run dev`, or  
-- Put `VITE_VERIFIER_ADDRESS=0x<your_address>` in `app/.env` and run `bun run dev`.
-
-Then run the proof flow again in the app.
+---
 
 ## Troubleshooting
 
-**"Failed to fetch" at "Generating proof"** — Proof generation needs a CRS (Common Reference String) from the network. The app rewrites the default CRS host to a more reliable CDN in two ways: (1) a Vite plugin in `app/vite.config.ts` that replaces `crs.aztec.network` with `crs.aztec-cdn.foundation` when bundling, and (2) a direct patch in `app/node_modules/@aztec/bb.js/dest/browser/crs/net_crs.js` (re-run the same URL replacements after `bun install` if the error returns). Restart the dev server after any change. If the error persists, check network/firewall or try again later.
+- **“Contract not found” on Verify on-chain**  
+  Verifier not deployed or wrong network. Deploy with `make declare-verifier` and `make deploy-verifier` on the same RPC (e.g. devnet), then set `VITE_VERIFIER_ADDRESS` and `VITE_RPC_URL`.
+
+- **“Failed to fetch” during proof generation**  
+  Barretenberg needs the CRS (Common Reference String). The app uses a Vite plugin and `crs-net-fallback.ts` to point to a working CDN. If it still fails, run `make download-crs` so `~/.bb-crs` is populated, then restart the dev server. Ensure no firewall blocks access to the CRS host.
+
+- **MetaMask Snap / “loading chunk” errors**  
+  If the Snap fails to load remote assets, the UI suggests using the manual address field and entering a Starknet address directly.
+
+---
 
 ## Useful links
 
-- Noir quickstart https://noir-lang.org/docs/getting_started/quick_start
-- Garaga docs https://garaga.gitbook.io/garaga/deploy-your-snark-verifier-on-starknet/noir
-- Starknet.js docs https://starknetjs.com/docs/guides/intro
-- Starknet quickstart https://docs.starknet.io/quick-start/overview/
-- Sncast 101 https://foundry-rs.github.io/starknet-foundry/starknet/101.html
-- Cairo book https://book.cairo-lang.org/
->>>>>>> Stashed changes
+- [Noir quickstart](https://noir-lang.org/docs/getting_started/quick_start)
+- [Garaga docs](https://garaga.gitbook.io/garaga/deploy-your-snark-verifier-on-starknet/noir)
+- [Starknet.js](https://starknetjs.com/docs/guides/intro)
+- [Starknet quickstart](https://docs.starknet.io/quick-start/overview/)
+- [Sncast 101](https://foundry-rs.github.io/starknet-foundry/starknet/101.html)
+- [Cairo book](https://book.cairo-lang.org/)
